@@ -64,6 +64,12 @@ const sharedGeometry = new RoundedBoxGeometry(
 const TEX_SIZE = 512;
 const CELL     = TEX_SIZE / 3;
 
+function cubeIdFromIndex(i) {
+  if (i < 26) return String.fromCharCode(97 + i);
+  i -= 26;
+  return String.fromCharCode(97 + Math.floor(i / 26)) + String.fromCharCode(97 + (i % 26));
+}
+
 function powerToRGB(p) {
   if (p < 0.5) {
     const t = p * 2;
@@ -73,55 +79,44 @@ function powerToRGB(p) {
   return [Math.round(150 + t * 105), Math.round(150 - t * 150), Math.round(150 - t * 150)];
 }
 
-function drawCoil(ctx, cx, cy, cellSize, power) {
+function drawCoil(ctx, cx, cy, cellSize, power, id) {
   const [r, g, b] = powerToRGB(power);
-  const color  = `rgb(${r},${g},${b})`;
-  const maxR   = cellSize * 0.36;
-  const lw     = cellSize * 0.066;
-  const gap    = lw * 0.45;
-  const rings  = 4;
+  const radius = cellSize * 0.38;
+  const lw     = cellSize * 0.055;
 
-  const grd = ctx.createRadialGradient(cx, cy, 0, cx, cy, maxR + lw * 3);
-  grd.addColorStop(0, `rgba(${r},${g},${b},0.18)`);
+  // Soft glow behind circle
+  const grd = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius * 1.6);
+  grd.addColorStop(0, `rgba(${r},${g},${b},0.15)`);
   grd.addColorStop(1, "rgba(0,0,0,0)");
   ctx.fillStyle = grd;
   ctx.beginPath();
-  ctx.arc(cx, cy, maxR + lw * 3, 0, Math.PI * 2);
+  ctx.arc(cx, cy, radius * 1.6, 0, Math.PI * 2);
   ctx.fill();
 
+  // Dark filled circle body
   ctx.fillStyle = "#070d14";
   ctx.beginPath();
-  ctx.arc(cx, cy, maxR + lw * 1.1, 0, Math.PI * 2);
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
   ctx.fill();
 
-  for (let i = 0; i < rings; i++) {
-    const ringR = maxR - i * (lw + gap);
-    if (ringR < lw / 2) break;
-    const alpha = 0.45 + 0.55 * ((rings - i) / rings);
-    ctx.strokeStyle = `rgba(${r},${g},${b},${alpha.toFixed(2)})`;
-    ctx.lineWidth   = lw;
-    ctx.beginPath();
-    ctx.arc(cx, cy, ringR, 0, Math.PI * 2);
-    ctx.stroke();
-  }
-
-  ctx.fillStyle  = color;
-  ctx.shadowColor = color;
-  ctx.shadowBlur  = lw * 2;
+  // Colored stroke ring — brightness encodes power
+  const alpha = 0.4 + 0.6 * power;
+  ctx.strokeStyle = `rgba(${r},${g},${b},${alpha.toFixed(2)})`;
+  ctx.lineWidth   = lw;
   ctx.beginPath();
-  ctx.arc(cx, cy, lw * 0.75, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.shadowBlur = 0;
+  ctx.arc(cx, cy, radius - lw / 2, 0, Math.PI * 2);
+  ctx.stroke();
 
-  const fontSize = Math.round(cellSize * 0.11);
-  ctx.fillStyle      = `rgba(${r},${g},${b},0.9)`;
-  ctx.font           = `bold ${fontSize}px monospace`;
-  ctx.textAlign      = "center";
-  ctx.textBaseline   = "top";
-  ctx.fillText(`${Math.round(power * 100)}%`, cx, cy + maxR + lw * 1.5);
+  // ID label centered inside
+  const fontSize = Math.round(cellSize * 0.18);
+  ctx.fillStyle    = `rgba(${r},${g},${b},0.92)`;
+  ctx.font         = `bold ${fontSize}px monospace`;
+  ctx.textAlign    = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(id, cx, cy);
 }
 
-function drawFace(canvas, coils) {
+function drawFace(canvas, coils, cubeId, faceIdx) {
   const ctx = canvas.getContext("2d");
   ctx.fillStyle = "#0c1520";
   ctx.fillRect(0, 0, TEX_SIZE, TEX_SIZE);
@@ -134,12 +129,14 @@ function drawFace(canvas, coils) {
   }
 
   coils.forEach((c, idx) => {
-    drawCoil(ctx, (idx % 3) * CELL + CELL / 2, Math.floor(idx / 3) * CELL + CELL / 2, CELL, c.power);
+    const dipoleChar = String.fromCharCode(97 + idx);
+    const id = `${cubeId}${faceIdx}${dipoleChar}`;
+    drawCoil(ctx, (idx % 3) * CELL + CELL / 2, Math.floor(idx / 3) * CELL + CELL / 2, CELL, c.power, id);
   });
 }
 
 // ─── Module factory ───────────────────────────────────────────────────────────
-function createModule(posX, label) {
+function createModule(posX, cubeId) {
   // Independent coil power state
   const coilData = Array.from({ length: 6 }, () =>
     Array.from({ length: 9 }, () => ({
@@ -153,7 +150,7 @@ function createModule(posX, label) {
   const textures = Array.from({ length: 6 }, (_, fi) => {
     const canvas = document.createElement("canvas");
     canvas.width = canvas.height = TEX_SIZE;
-    drawFace(canvas, coilData[fi]);
+    drawFace(canvas, coilData[fi], cubeId, fi);
     const tex = new THREE.CanvasTexture(canvas);
     tex.userData.canvas = canvas;
     return tex;
@@ -167,21 +164,6 @@ function createModule(posX, label) {
   mesh.castShadow = mesh.receiveShadow = true;
   scene.add(mesh);
 
-  // Floating label
-  const lc = document.createElement("canvas");
-  lc.width = 256; lc.height = 64;
-  const lctx = lc.getContext("2d");
-  lctx.font = "bold 28px monospace";
-  lctx.fillStyle = "#8b949e";
-  lctx.textAlign = "center";
-  lctx.textBaseline = "middle";
-  lctx.fillText(label, 128, 32);
-  const labelSprite = new THREE.Sprite(
-    new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(lc), transparent: true })
-  );
-  labelSprite.scale.set(1.4, 0.35, 1);
-  labelSprite.position.set(posX, CONFIG.CUBE_SIZE / 2 + 0.5, 0);
-  scene.add(labelSprite);
 
   // Rigid body — initial position + random spin
   const rb = new RigidBody(new THREE.Vector3(posX, 0, 0));
@@ -193,14 +175,14 @@ function createModule(posX, label) {
     );
   }
 
-  return { mesh, coilData, textures, labelSprite, rigidBody: rb };
+  return { mesh, coilData, textures, rigidBody: rb, cubeId };
 }
 
 // ─── Spawn two modules ────────────────────────────────────────────────────────
 const GAP     = 2.4;
 const modules = [
-  createModule(-GAP / 2, "MODULE A"),
-  createModule( GAP / 2, "MODULE B"),
+  createModule(-GAP / 2, cubeIdFromIndex(0)),
+  createModule( GAP / 2, cubeIdFromIndex(1)),
 ];
 
 // ─── Physics simulation ───────────────────────────────────────────────────────
@@ -246,9 +228,9 @@ let lastTexUpdate = 0;
 function maybeRedrawTextures(now) {
   if (now - lastTexUpdate < 33) return;   // ~30 fps redraws
   lastTexUpdate = now;
-  for (const { coilData, textures } of modules) {
+  for (const { coilData, textures, cubeId } of modules) {
     for (let fi = 0; fi < 6; fi++) {
-      drawFace(textures[fi].userData.canvas, coilData[fi]);
+      drawFace(textures[fi].userData.canvas, coilData[fi], cubeId, fi);
       textures[fi].needsUpdate = true;
     }
   }
@@ -287,6 +269,24 @@ bindSlider("damp-slider",     "damp-val",     3, v => { CONFIG.LINEAR_DAMPING = 
 bindSlider("strength-slider", "strength-val", 2, v => { CONFIG.MU_OVER_4PI = v; });
 
 document.getElementById("restart-btn").addEventListener("click", applyRandomSpin);
+
+// ─── Dipole API ───────────────────────────────────────────────────────────────
+// setDipole("a4d", 0.8) — cubeId(letters) + faceNum(0-5) + dipoleChar(a-i)
+window.setDipole = function(id, strength) {
+  const match = id.match(/^([a-z]+)([0-5])([a-z])$/);
+  if (!match) { console.warn(`setDipole: invalid id "${id}"`); return; }
+  const [, cubeId, faceStr, dipoleChar] = match;
+  const faceIdx   = parseInt(faceStr, 10);
+  const coilIdx   = dipoleChar.charCodeAt(0) - 97;
+  const mod = modules.find(m => m.cubeId === cubeId);
+  if (!mod) { console.warn(`setDipole: no module with cubeId "${cubeId}"`); return; }
+  if (coilIdx < 0 || coilIdx >= mod.coilData[faceIdx].length) {
+    console.warn(`setDipole: dipole "${dipoleChar}" out of range`); return;
+  }
+  const coil = mod.coilData[faceIdx][coilIdx];
+  coil.power  = strength;
+  coil.target = strength;
+};
 
 // ─── Render loop ──────────────────────────────────────────────────────────────
 let lastTime = performance.now();
