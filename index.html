@@ -45,7 +45,7 @@
         text-align: right;
         color: #8b949e;
       }
-      #restart-btn {
+      #restart-btn, #demo-btn {
         background: #21262d;
         border: 1px solid #30363d;
         color: #c9d1d9;
@@ -55,7 +55,24 @@
         font-size: 13px;
         transition: background 0.15s;
       }
-      #restart-btn:hover { background: #30363d; }
+      #restart-btn:hover, #demo-btn:hover { background: #30363d; }
+      #demo-btn { border-color: #3d8bfd; color: #79b8ff; }
+
+      #ws-status {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        font-size: 12px;
+        color: #8b949e;
+        padding-top: 2px;
+      }
+      #ws-dot {
+        width: 9px; height: 9px;
+        border-radius: 50%;
+        background: #f85149;
+        flex-shrink: 0;
+        transition: background 0.3s;
+      }
 
       #hint {
         position: fixed;
@@ -88,6 +105,11 @@
         <span class="val" id="strength-val">0.40</span>
       </label>
       <button id="restart-btn">⟳ Restart</button>
+      <button id="demo-btn">▶ Attract Demo</button>
+      <div id="ws-status">
+        <div id="ws-dot"></div>
+        <span id="ws-text">No Python server</span>
+      </div>
     </div>
 
     <div id="hint">
