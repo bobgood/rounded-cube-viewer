@@ -1,26 +1,17 @@
 #!/usr/bin/env python3
 """
-server.py  —  Python driver for the rounded-cube viewer
-────────────────────────────────────────────────────────
-Connects to the Three.js viewer over WebSocket on port 8765.
+server.py  -  Python driver for the rounded-cube FEA viewer
 
-Messages  Python → Browser:
-  { "type": "frame",
-    "cubes": [
-      { "id": "a",
-        "pos":   [x, y, z],
-        "quat":  [qx, qy, qz, qw],   # unit quaternion
-        "coils": [[p]*9, [p]*9, [p]*9, [p]*9, [p]*9, [p]*9]  # 6 faces × 9 coils, p ∈ [-1, 1]
-      }, ...
-    ]
-  }
+Messages  Python -> Browser:
+  { "type": "voxel_scene", ... }          cylinder view geometry (sent once on connect/view-switch)
+  { "type": "frame", "cubes": [...] }     spinning-cubes animation (streamed at ~30 fps)
 
-Messages  Browser → Python:
-  { "type": "ui",     "spin": f, "damping": f, "strength": f }
-  { "type": "button", "id": "restart" | "demo" }
+Messages  Browser -> Python:
+  { "type": "ui_state",  "spin": f, "damping": f, "strength": f }
+  { "type": "view",      "view": "cylinder" | "spinning_cubes" }
 
 Install:  pip install websockets
-Run:      python server.py
+Run:      python -u server.py
           then open http://localhost:5173/rounded-cube-viewer/
 """
 
@@ -29,70 +20,71 @@ import json
 import math
 
 import websockets
-from websockets.server import serve
+from websockets import serve
 
-# ── shared state ──────────────────────────────────────────────────────────────
-clients: set = set()
-ui_state: dict = {}          # last UI values received from browser
+from fea_model import build_voxel_scene
+
+# ── Shared state ──────────────────────────────────────────────────────────────
+clients:      set  = set()
+ui_state:     dict = {"spin": 0.8, "damping": 0.985, "strength": 0.4}
+current_view: str  = "cylinder"
+
+# Pre-build and serialise the FEA scene at startup (takes a few seconds)
+_voxel_scene_json: str = json.dumps(build_voxel_scene(), separators=(',', ':'))
 
 
-# ── demo scene builder ────────────────────────────────────────────────────────
-def make_quat(ax, ay, az, angle: float) -> list[float]:
-    """Axis-angle → unit quaternion [qx, qy, qz, qw]."""
+# ── Spinning-cubes demo ───────────────────────────────────────────────────────
+
+def _make_quat(ax, ay, az, angle):
     s = math.sin(angle / 2)
     return [ax * s, ay * s, az * s, math.cos(angle / 2)]
 
 
-def build_frame(t: float) -> dict:
-    """
-    First-pass demo: two cubes sitting still, slowly spinning on different axes,
-    with all coil powers rippling sinusoidally so you can verify the widget IDs.
-    Replace this function with your magnetic model.
-    """
-    def ripple_coils(phase_offset: float) -> list[list[float]]:
-        """Each coil oscillates independently so you can watch the labels."""
+def _build_frame(t):
+    def ripple(phase):
         return [
-            [0.5 + 0.5 * math.sin(t * 1.1 + fi * 0.9 + ci * 0.4 + phase_offset)
+            [0.5 + 0.5 * math.sin(t * 1.1 + fi * 0.9 + ci * 0.4 + phase)
              for ci in range(9)]
             for fi in range(6)
         ]
-
     return {
         "type": "frame",
         "cubes": [
-            {
-                "id":    "a",
-                "pos":   [-1.2, 0.0, 0.0],
-                "quat":  make_quat(0, 1, 0,  t * 0.4),   # spin around Y
-                "coils": ripple_coils(0.0),
-            },
-            {
-                "id":    "b",
-                "pos":   [ 1.2, 0.0, 0.0],
-                "quat":  make_quat(1, 0, 0, -t * 0.3),   # spin around X (opposite)
-                "coils": ripple_coils(math.pi),            # out of phase with cube a
-            },
+            {"id": "a", "pos": [-1.2, 0.0, 0.0],
+             "quat": _make_quat(0, 1, 0,  t * 0.4),  "coils": ripple(0.0)},
+            {"id": "b", "pos": [ 1.2, 0.0, 0.0],
+             "quat": _make_quat(1, 0, 0, -t * 0.3),  "coils": ripple(math.pi)},
         ],
     }
 
 
 # ── WebSocket handler ─────────────────────────────────────────────────────────
+
 async def handler(ws):
+    global current_view
     clients.add(ws)
     print(f"[+] browser connected   (active: {len(clients)})")
     try:
         async for raw in ws:
             try:
                 msg = json.loads(raw)
-                if msg.get("type") == "ui":
+                t   = msg.get("type")
+
+                if t == "ui_state":
                     ui_state.update(msg)
                     print(f"[ui]  spin={msg.get('spin')}  "
                           f"damp={msg.get('damping')}  "
                           f"strength={msg.get('strength')}")
-                elif msg.get("type") == "button":
-                    print(f"[btn] {msg['id']}")
+
+                elif t == "view":
+                    current_view = msg.get("view", "cylinder")
+                    print(f"[view] {current_view}")
+                    if current_view == "cylinder":
+                        await ws.send(_voxel_scene_json)
+
             except (json.JSONDecodeError, KeyError):
                 pass
+
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
@@ -100,32 +92,30 @@ async def handler(ws):
         print(f"[-] browser disconnected (active: {len(clients)})")
 
 
-# ── broadcast loop ─────────────────────────────────────────────────────────────
-async def broadcast_loop(fps: int = 60):
-    t   = 0.0
-    dt  = 1.0 / fps
+# ── Broadcast loop ─────────────────────────────────────────────────────────────
+
+async def broadcast_loop(fps=30):
+    t  = 0.0
+    dt = 1.0 / fps
     while True:
-        if clients:
-            frame = json.dumps(build_frame(t))
-            results = await asyncio.gather(
+        if clients and current_view == "spinning_cubes":
+            frame = json.dumps(_build_frame(t))
+            await asyncio.gather(
                 *[c.send(frame) for c in list(clients)],
                 return_exceptions=True,
             )
-            # silently drop stale connections that errored
-            for c, r in zip(list(clients), results):
-                if isinstance(r, Exception):
-                    clients.discard(c)
         t  += dt
         await asyncio.sleep(dt)
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
+
 async def main():
-    print("─" * 52)
+    print("-" * 52)
     print("  Cube viewer Python server")
     print("  WebSocket : ws://localhost:8765")
     print("  Browser   : http://localhost:5173/rounded-cube-viewer/")
-    print("─" * 52)
+    print("-" * 52)
     async with serve(handler, "localhost", 8765):
         await broadcast_loop()
 

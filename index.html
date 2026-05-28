@@ -14,11 +14,11 @@
       }
       #app { width: 100%; height: 100%; }
 
+      /* ── Control panel ── */
       #controls {
         position: fixed;
-        top: 12px;
-        right: 12px;
-        background: rgba(13,17,23,0.85);
+        top: 12px; right: 12px;
+        background: rgba(13,17,23,0.88);
         border: 1px solid #30363d;
         border-radius: 8px;
         padding: 12px 16px;
@@ -27,7 +27,7 @@
         display: flex;
         flex-direction: column;
         gap: 10px;
-        min-width: 200px;
+        min-width: 210px;
         backdrop-filter: blur(6px);
       }
       #controls label {
@@ -41,11 +41,21 @@
         accent-color: #3d8bfd;
       }
       #controls span.val {
-        min-width: 32px;
+        min-width: 36px;
         text-align: right;
         color: #8b949e;
       }
-      #restart-btn, #demo-btn {
+      #controls select {
+        width: 100%;
+        background: #21262d;
+        border: 1px solid #30363d;
+        color: #c9d1d9;
+        border-radius: 6px;
+        padding: 4px 6px;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      #restart-btn {
         background: #21262d;
         border: 1px solid #30363d;
         color: #c9d1d9;
@@ -55,25 +65,47 @@
         font-size: 13px;
         transition: background 0.15s;
       }
-      #restart-btn:hover, #demo-btn:hover { background: #30363d; }
-      #demo-btn { border-color: #3d8bfd; color: #79b8ff; }
+      #restart-btn:hover { background: #30363d; }
 
-      #ws-status {
+      /* ── Scene checklist (horizontal) ── */
+      #scene-checklist {
+        display: flex;
+        flex-direction: row;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .cl-item {
         display: flex;
         align-items: center;
-        gap: 7px;
-        font-size: 12px;
-        color: #8b949e;
-        padding-top: 2px;
+        gap: 4px;
+        cursor: pointer;
+        white-space: nowrap;
       }
-      #ws-dot {
-        width: 9px; height: 9px;
-        border-radius: 50%;
-        background: #f85149;
-        flex-shrink: 0;
-        transition: background 0.3s;
+      .cl-item input[type=checkbox] {
+        accent-color: #3d8bfd;
+        cursor: pointer;
+      }
+      .cl-item label { cursor: pointer; }
+
+      /* ── Hover info ── */
+      #hover-info {
+        position: fixed;
+        bottom: 40px;
+        left: 12px;
+        background: rgba(13,17,23,0.80);
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 4px 10px;
+        color: #58a6ff;
+        font-size: 13px;
+        font-family: monospace;
+        pointer-events: none;
+        min-height: 26px;
+        min-width: 60px;
       }
 
+      /* ── Hint bar ── */
       #hint {
         position: fixed;
         left: 12px;
@@ -89,6 +121,24 @@
     <div id="app"></div>
 
     <div id="controls">
+
+      <!-- View selector -->
+      <select id="view-select">
+        <option value="cylinder">Cylinder view</option>
+        <option value="spinning_cubes">Spinning cubes</option>
+      </select>
+
+      <!-- Scene element checklist — populated by JS -->
+      <div id="scene-checklist"></div>
+
+      <!-- Transparency -->
+      <label>
+        Opacity
+        <input type="range" id="opacity-slider" min="0" max="1" step="0.01" value="1">
+        <span class="val" id="opacity-val">1.00</span>
+      </label>
+
+      <!-- Physics sliders (Python reads & can use or ignore) -->
       <label>
         Spin
         <input type="range" id="spin-slider" min="0" max="5" step="0.1" value="0.8">
@@ -104,17 +154,15 @@
         <input type="range" id="strength-slider" min="0" max="2" step="0.05" value="0.4">
         <span class="val" id="strength-val">0.40</span>
       </label>
-      <button id="restart-btn">⟳ Restart</button>
-      <button id="demo-btn">▶ Attract Demo</button>
-      <div id="ws-status">
-        <div id="ws-dot"></div>
-        <span id="ws-text">No Python server</span>
-      </div>
+
+      <button id="restart-btn">&#8635; Restart</button>
     </div>
 
-    <div id="hint">
-      Left drag: orbit · Right drag: pan · Scroll: zoom
-    </div>
+    <!-- Hover label -->
+    <div id="hover-info"></div>
+
+    <div id="hint">Left drag: orbit &nbsp;·&nbsp; Right drag: pan &nbsp;·&nbsp; Scroll: zoom</div>
+
     <script type="module" src="/main.js"></script>
   </body>
 </html>
