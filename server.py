@@ -9,6 +9,7 @@ Messages  Python -> Browser:
 Messages  Browser -> Python:
   { "type": "ui_state",  "spin": f, "damping": f, "strength": f }
   { "type": "view",      "view": "cylinder" | "spinning_cubes" }
+  { "type": "fea_start", "strength": f }   optional: rebuild coil amps × strength
 
 Install:  pip install websockets
 Run:      python -u server.py
@@ -33,11 +34,11 @@ current_view: str  = "cylinder"
 _voxel_scene_json: str = json.dumps(build_voxel_scene(), separators=(',', ':'))
 
 
-def _refresh_voxel_scene(cu_amplitudes=None, cu_scale=1.0):
+def _refresh_voxel_scene(fea_strength_scale=1.0):
     global _voxel_scene_json
     invalidate_cache()
     _voxel_scene_json = json.dumps(
-        build_voxel_scene(force=True, cu_amplitudes=cu_amplitudes, cu_scale=cu_scale),
+        build_voxel_scene(force=True, fea_strength_scale=fea_strength_scale),
         separators=(',', ':'),
     )
 
@@ -81,26 +82,16 @@ async def handler(ws):
 
                 if t == "ui_state":
                     ui_state.update(msg)
-                    cu_changed = (
-                        "cu_scale" in msg
-                        or "cu_amplitudes" in msg
-                        or "cu_reverse" in msg
-                    )
-                    if cu_changed:
-                        amps = msg.get("cu_amplitudes")
-                        scale = float(msg.get("cu_scale", 1.0))
-                        if msg.get("cu_reverse"):
-                            if amps is None:
-                                from fea_config import CU_FACE_AMPLITUDE
-                                amps = [-a for a in CU_FACE_AMPLITUDE]
-                            else:
-                                amps = [-a for a in amps]
-                        _refresh_voxel_scene(cu_amplitudes=amps, cu_scale=scale)
-                        if current_view == "cylinder":
-                            await ws.send(_voxel_scene_json)
                     print(f"[ui]  spin={msg.get('spin')}  "
                           f"damp={msg.get('damping')}  "
                           f"strength={msg.get('strength')}")
+
+                elif t == "fea_start":
+                    scale = float(msg.get("strength", ui_state.get("strength", 1.0)))
+                    print(f"[fea] start  strength_scale={scale}")
+                    _refresh_voxel_scene(fea_strength_scale=scale)
+                    if current_view == "cylinder":
+                        await ws.send(_voxel_scene_json)
 
                 elif t == "view":
                     current_view = msg.get("view", "cylinder")
@@ -141,6 +132,7 @@ async def main():
     print("  Cube viewer Python server")
     print("  WebSocket : ws://localhost:8765")
     print("  Browser   : http://localhost:5173/rounded-cube-viewer/")
+    print("  Coil init : coil_init.py (restart server after edits)")
     print("-" * 52)
     async with serve(handler, "localhost", 8765):
         await broadcast_loop()

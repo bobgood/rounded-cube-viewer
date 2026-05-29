@@ -6,6 +6,7 @@ Generates a regular n-gon prism frame:
   - 6 plate faces   — 4 spin-wheel quadrant panels per face (n=4 only)
   - 6 Hs assemblies — coaxial hole pipes + back washer per face (n=4 only)
   - 6 Cu FEA fields — fixed pipe volume + per-site current dir/amp (n=4; arrows in JS)
+  - 24 Cv edge coils — 2 per Cy edge (n=4; arrows in JS)
 
 FRAME_EDGE_MM  is the outer envelope. Cylinder rods sit on
 an inset skeleton (see _skeleton_dims). Caps, plates, and Ou may still use
@@ -25,6 +26,7 @@ Scene message format
   "cu":        { "face_amplitudes", "objects",
                   "sites": { "positions", "directions", "amplitudes" },
                   "color_positive", "color_negative" }
+  "cv":        { "objects", "sites": { ... }, "color_positive", "color_negative" }
 }
 Each "objects" list: [{"id":"cy0","label":"E12","start":0,"count":N}, ...]
 Cube (n=4): corners C1–C8, edges E12, faces F1234 (clockwise corner ids).
@@ -66,11 +68,22 @@ from fea_config import (
     CU_PIPE_WALL_THICKNESS_MM,
     CU_PIPE_EXTENSION_MM,
     CU_SITE_SPACING_MM,
+    COIL_ARROW_COLOR_POSITIVE,
+    COIL_ARROW_COLOR_NEGATIVE,
     CU_COLOR_POSITIVE,
     CU_COLOR_NEGATIVE,
-    CU_FACE_AMPLITUDE,
+    CV_GAP_FROM_CORNER_MM,
+    CV_EXTEND_MM,
+    CV_THICKNESS_MM,
+    CV_CLEARANCE_FROM_ROD_MM,
+    CV_SITE_SPACING_MM,
+    CV_COLOR_POSITIVE,
+    CV_COLOR_NEGATIVE,
+    CV_DEFAULT_AMPLITUDE,
     MM_TO_SCENE,
 )
+
+from coil_init import cu_coil_weight, cv_coil_key, cv_coil_weight, export_coil_table
 
 
 # ── Cube topology labels (FRAME_SIDES == 4 only) ─────────────────────────────
@@ -335,10 +348,10 @@ def _cu_coil_sample_points(axis, face_coord, length_mm, r_coil):
     return pts
 
 
-def _build_cu_face_field(axis, face_coord, face_amplitude, hs_length_mm,
+def _build_cu_face_field(axis, face_coord, coil_weight, hs_length_mm,
                          extension_mm, outer_edge_mm, outer_height_mm, ou_round_mm):
-    """FEA sites on coil path outside Hs inner pipe OD (not inside outer-pipe bore)."""
-    if abs(face_amplitude) < 1e-6:
+    """FEA sites on coil path; direction fixed CCW, coil_weight is display/FEA scale only."""
+    if abs(coil_weight) < 1e-6:
         return []
     r_in, r_out, r_io, r_oi = _cu_pipe_radii_mm()
     r_coil = _cu_coil_radius_mm()
@@ -365,11 +378,181 @@ def _build_cu_face_field(axis, face_coord, face_amplitude, hs_length_mm,
             continue
         if r > r_oi - CU_CLEARANCE_FROM_HS_OUTER_MM * 0.5:
             continue
-        tx, ty, tz = _tangent_around_axis(axis, x, y, z, face_amplitude)
+        tx, ty, tz = _tangent_around_axis(axis, x, y, z, 1.0)
         if tx == ty == tz == 0.0:
             continue
-        sites.append((x, y, z, tx, ty, tz, float(face_amplitude)))
+        sites.append((x, y, z, tx, ty, tz, float(coil_weight)))
     return sites
+
+
+def _cv_coil_radius_mm():
+    return CYLINDER_RADIUS_MM + CV_CLEARANCE_FROM_ROD_MM + CV_THICKNESS_MM * 0.5
+
+
+def _edge_axis(p1, p2):
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    dz = p2[2] - p1[2]
+    length = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if length < 1e-6:
+        return None
+    return (dx / length, dy / length, dz / length), length
+
+
+def _perp_basis(u):
+    ux, uy, uz = u
+    if abs(uz) < 0.9:
+        rx, ry, rz = 0.0, 0.0, 1.0
+    else:
+        rx, ry, rz = 1.0, 0.0, 0.0
+    vx = uy * rz - uz * ry
+    vy = uz * rx - ux * rz
+    vz = ux * ry - uy * rx
+    vl = math.sqrt(vx * vx + vy * vy + vz * vz)
+    if vl < 1e-9:
+        return None
+    vx, vy, vz = vx / vl, vy / vl, vz / vl
+    wx = uy * vz - uz * vy
+    wy = uz * vx - ux * vz
+    wz = ux * vy - uy * vx
+    wl = math.sqrt(wx * wx + wy * wy + wz * wz)
+    if wl < 1e-9:
+        return None
+    return (vx, vy, vz), (wx / wl, wy / wl, wz / wl)
+
+
+def _cv_tangent_ccw(u, px, py, pz, ax, ay, az, view_from_c1):
+    """CCW around +u when viewed from corner c1; flip for coil at c2 end."""
+    ux, uy, uz = u
+    rx, ry, rz = px - ax, py - ay, pz - az
+    dot = rx * ux + ry * uy + rz * uz
+    rx -= dot * ux
+    ry -= dot * uy
+    rz -= dot * uz
+    rl = math.sqrt(rx * rx + ry * ry + rz * rz)
+    if rl < 1e-9:
+        return (0.0, 0.0, 0.0)
+    tx = uy * rz - uz * ry
+    ty = uz * rx - ux * rz
+    tz = ux * ry - uy * rx
+    tl = math.sqrt(tx * tx + ty * ty + tz * tz)
+    if tl < 1e-9:
+        return (0.0, 0.0, 0.0)
+    sgn = 1.0 if view_from_c1 else -1.0
+    return (sgn * tx / tl, sgn * ty / tl, sgn * tz / tl)
+
+
+def _sample_cv_coil_end(anchor, u, s_lo, s_hi, r_coil, amplitude, view_from_c1):
+    """Samples on one coil sleeve at an edge end (anchor = corner end)."""
+    if abs(amplitude) < 1e-6:
+        return []
+    basis = _perp_basis(u)
+    if basis is None:
+        return []
+    v, w = basis
+    ux, uy, uz = u
+    n_along = max(1, int((s_hi - s_lo) / CV_SITE_SPACING_MM))
+    n_around = max(8, int(2.0 * math.pi * r_coil / CV_SITE_SPACING_MM))
+    sign = 1.0 if view_from_c1 else -1.0
+    sites = []
+    for ia in range(n_along):
+        s = s_lo + (ia + 0.5) / n_along * (s_hi - s_lo)
+        ax = anchor[0] + sign * ux * s
+        ay = anchor[1] + sign * uy * s
+        az = anchor[2] + sign * uz * s
+        for ik in range(n_around):
+            th = 2.0 * math.pi * ik / n_around
+            c, sn = math.cos(th), math.sin(th)
+            px = ax + r_coil * (c * v[0] + sn * w[0])
+            py = ay + r_coil * (c * v[1] + sn * w[1])
+            pz = az + r_coil * (c * v[2] + sn * w[2])
+            tx, ty, tz = _cv_tangent_ccw(u, px, py, pz, ax, ay, az, view_from_c1)
+            if tx == ty == tz == 0.0:
+                continue
+            sites.append((px, py, pz, tx, ty, tz, float(amplitude)))
+    return sites
+
+
+def _iter_cube_edges(vertices, half_h):
+    """Yield (c1, c2, p1_mm, p2_mm) for 12 cube skeleton edges."""
+    for k in range(4):
+        vx0, vy0 = vertices[k]
+        vx1, vy1 = vertices[(k + 1) % 4]
+        for z_sign in (+1, -1):
+            cz = z_sign * half_h
+            yield (
+                _cube_corner(k, z_sign),
+                _cube_corner((k + 1) % 4, z_sign),
+                (vx0, vy0, cz),
+                (vx1, vy1, cz),
+            )
+    for k in range(4):
+        vx, vy = vertices[k]
+        yield (
+            _cube_corner(k, +1),
+            _cube_corner(k, -1),
+            (vx, vy, half_h),
+            (vx, vy, -half_h),
+        )
+
+
+def _build_cv_edge_coils(vertices, half_h, weight_scale: float = 1.0):
+    """24 coils: at each edge end, E{c1}{c2} near c1 and E{c2}{c1} near c2."""
+    gap = CV_GAP_FROM_CORNER_MM
+    ext = CV_EXTEND_MM
+
+    def _display(w: float) -> float:
+        return max(-1.0, min(1.0, float(w) * float(weight_scale)))
+
+    pos_all: list = []
+    dir_all: list = []
+    amp_all: list = []
+    objects: list = []
+    coil_idx = 0
+
+    for c1, c2, p1, p2 in _iter_cube_edges(vertices, half_h):
+        axis = _edge_axis(p1, p2)
+        if axis is None:
+            continue
+        u, length = axis
+        if length < 2.0 * gap + ext + 0.5:
+            continue
+
+        ends = (
+            (p1, True,  c1, c2, f"E{c1}{c2}"),
+            (p2, False, c2, c1, f"E{c2}{c1}"),
+        )
+        for anchor, from_c1, near_c, far_c, label in ends:
+            weight = _display(cv_coil_weight(near_c, label))
+            if abs(weight) < 1e-6:
+                continue
+            coil_key = cv_coil_key(near_c, label)
+            start = len(pos_all)
+            chunk = _sample_cv_coil_end(
+                anchor, u, gap, gap + ext, _cv_coil_radius_mm(),
+                weight, from_c1,
+            )
+            for (x, y, z, tx, ty, tz, a) in chunk:
+                pos_all.append((x, y, z))
+                dir_all.append((tx, ty, tz))
+                amp_all.append(a)
+            count = len(pos_all) - start
+            if count > 0:
+                objects.append({
+                    "id": f"cv{coil_idx}",
+                    "label": label,
+                    "edge": label,
+                    "corners": [near_c, far_c],
+                    "end_corner": near_c,
+                    "coil_key": coil_key,
+                    "coil_weight": round(weight, 4),
+                    "start": start,
+                    "count": count,
+                    "amplitude": round(weight, 4),
+                })
+                coil_idx += 1
+
+    return pos_all, dir_all, amp_all, objects
 
 
 def _build_hs_face_voxels(axis, face_coord, length_mm, r_inner_od, r_outer_od,
@@ -508,10 +691,14 @@ def invalidate_cache():
     _scene_cache = None
 
 
-def build_voxel_scene(force=False, cu_amplitudes=None, cu_scale=1.0):
-    """Build (or return cached) the complete voxel scene dict."""
+def build_voxel_scene(force=False, fea_strength_scale=1.0):
+    """Build (or return cached) the complete voxel scene dict.
+
+    Coil colors/intensities come from coil_init.COIL (not fea_config).
+    fea_strength_scale multiplies coil weights when FEA is running (default 1).
+    """
     global _scene_cache
-    if _scene_cache is not None and not force and cu_amplitudes is None:
+    if _scene_cache is not None and not force and fea_strength_scale == 1.0:
         return _scene_cache
 
     n   = FRAME_SIDES
@@ -660,6 +847,8 @@ def build_voxel_scene(force=False, cu_amplitudes=None, cu_scale=1.0):
     plate_objects: list = []
 
     corner_pos_mm: dict = {}
+    fea_scale = float(fea_strength_scale)
+
     if n == 4:
         corner_pos_mm = _cube_corner_positions_mm(vertices, half_h)
 
@@ -762,8 +951,6 @@ def build_voxel_scene(force=False, cu_amplitudes=None, cu_scale=1.0):
         cu_dir:     list = []
         cu_amp:     list = []
         cu_objects: list = []
-        base_amps = list(cu_amplitudes if cu_amplitudes is not None else CU_FACE_AMPLITUDE)
-        face_amps = [float(a) * float(cu_scale) for a in base_amps]
         cu_faces = [
             ("z",  hz),
             ("z", -hz),
@@ -773,11 +960,15 @@ def build_voxel_scene(force=False, cu_amplitudes=None, cu_scale=1.0):
             ("y", -h),
         ]
         for fi, (axis, face_c) in enumerate(cu_faces):
-            amp = face_amps[fi] if fi < len(face_amps) else 1.0
+            face_str = _CUBE_FACE_CLOCKWISE[fi]
+            weight = max(-1.0, min(1.0, float(cu_coil_weight(face_str)) * fea_scale))
+            if abs(weight) < 1e-6:
+                continue
+            coil_key = f"f{face_str.lower()}"
             flbl = _cube_face_label(fi)
             start = len(cu_pos)
             for (x, y, z, tx, ty, tz, a) in _build_cu_face_field(
-                axis, face_c, amp,
+                axis, face_c, weight,
                 HS_LENGTH_MM, CU_PIPE_EXTENSION_MM,
                 E, H, ou_r,
             ):
@@ -787,10 +978,20 @@ def build_voxel_scene(force=False, cu_amplitudes=None, cu_scale=1.0):
             count = len(cu_pos) - start
             if count > 0:
                 cu_objects.append({
-                    "id": f"cu{fi}", "label": f"{flbl} I={amp:+.2f}",
-                    "start": start, "count": count,
-                    "amplitude": round(amp, 4),
+                    "id": f"cu{fi}",
+                    "label": f"{flbl} I={weight:+.2f}",
+                    "face": face_str,
+                    "coil_key": coil_key,
+                    "coil_weight": round(weight, 4),
+                    "start": start,
+                    "count": count,
+                    "amplitude": round(weight, 4),
                 })
+
+        # Cv: edge coils (2 per Cy edge; arrows in JS)
+        cv_pos, cv_dir, cv_amp, cv_objects = _build_cv_edge_coils(
+            vertices, half_h, weight_scale=fea_scale,
+        )
 
     else:
         hs_raw = []
@@ -799,13 +1000,17 @@ def build_voxel_scene(force=False, cu_amplitudes=None, cu_scale=1.0):
         cu_dir = []
         cu_amp = []
         cu_objects = []
-        face_amps = []
+        cv_pos = []
+        cv_dir = []
+        cv_amp = []
+        cv_objects = []
 
     total = len(cyl_raw) + len(cap_raw) + len(plate_raw) + len(hs_raw)
     print(
         f"[fea] total voxels: {total:,}  "
         f"({len(cyl_raw):,} cyl + {len(cap_raw):,} cap + {len(plate_raw):,} pl "
-        f"+ {len(hs_raw):,} hs)  |  Cu sites: {len(cu_pos):,}"
+        f"+ {len(hs_raw):,} hs)  |  Cu sites: {len(cu_pos):,}  "
+        f"Cv sites: {len(cv_pos):,}"
     )
 
     # ── Convert mm -> scene units ─────────────────────────────────────────────
@@ -826,7 +1031,7 @@ def build_voxel_scene(force=False, cu_amplitudes=None, cu_scale=1.0):
             "hole_diameter_mm": HOLE_DIAMETER_MM,
             "ho_color":         list(HO_COLOR),
             "mm_to_scene":      sc,
-            "cu_face_amplitudes": face_amps,
+            "coil_weights": export_coil_table(),
             **(
                 {
                     "cube_corners": {
@@ -861,17 +1066,39 @@ def build_voxel_scene(force=False, cu_amplitudes=None, cu_scale=1.0):
             "objects":   hs_objects,
             "positions": to_scene(hs_raw),
         }
+    if cu_pos or cv_pos:
+        scene["coil"] = {
+            "weights": export_coil_table(),
+            "color_positive": list(COIL_ARROW_COLOR_POSITIVE),
+            "color_negative": list(COIL_ARROW_COLOR_NEGATIVE),
+            "groups": {
+                "cv_corner": "c1..c8 (3 coils per corner)",
+                "cv_edge": "e12.. optional override",
+                "cu_face": "f1234..f3276",
+            },
+        }
     if cu_pos:
         scene["cu"] = {
-            "face_amplitudes":  face_amps,
             "objects":          cu_objects,
-            "color_positive":   list(CU_COLOR_POSITIVE),
-            "color_negative":   list(CU_COLOR_NEGATIVE),
+            "color_positive":   list(COIL_ARROW_COLOR_POSITIVE),
+            "color_negative":   list(COIL_ARROW_COLOR_NEGATIVE),
             "sites": {
                 "positions":   to_scene(cu_pos),
                 "directions":  [[round(a, 4), round(b, 4), round(c, 4)]
                                  for (a, b, c) in cu_dir],
                 "amplitudes":  [round(a, 4) for a in cu_amp],
+            },
+        }
+    if cv_pos:
+        scene["cv"] = {
+            "objects":        cv_objects,
+            "color_positive": list(COIL_ARROW_COLOR_POSITIVE),
+            "color_negative": list(COIL_ARROW_COLOR_NEGATIVE),
+            "sites": {
+                "positions":   to_scene(cv_pos),
+                "directions":  [[round(a, 4), round(b, 4), round(c, 4)]
+                                 for (a, b, c) in cv_dir],
+                "amplitudes":  [round(a, 4) for a in cv_amp],
             },
         }
 
@@ -881,11 +1108,13 @@ def build_voxel_scene(force=False, cu_amplitudes=None, cu_scale=1.0):
     n_pl  = len(plate_raw)
     n_hs  = len(hs_raw)
     n_cu  = len(cu_pos)
+    n_cv  = len(cv_pos)
     print(
         f"[fea] scene JSON ready: {len(scene_json):,} bytes  "
-        f"({n_cyl:,} cyl + {n_cap:,} cap + {n_pl:,} pl + {n_hs:,} hs + {n_cu:,} cu sites)"
+        f"({n_cyl:,} cyl + {n_cap:,} cap + {n_pl:,} pl + {n_hs:,} hs + "
+        f"{n_cu:,} cu + {n_cv:,} cv sites)"
     )
 
-    if cu_amplitudes is None and cu_scale == 1.0:
+    if fea_strength_scale == 1.0:
         _scene_cache = scene
     return scene

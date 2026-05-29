@@ -15,7 +15,7 @@ CYLINDER_COLOR = METAL_COLOR
 CAP_COLOR      = METAL_COLOR
 
 # ── Individual cylinder geometry ────────────────────────────────────────────
-CYLINDER_LENGTH_MM   = 20.0  # usable length of each rod (mm); centred on edge
+CYLINDER_LENGTH_MM   = 14.0  # usable length of each rod (mm); centred on edge
 CYLINDER_DIAMETER_MM =  7.0  # outer diameter (mm)
 CYLINDER_RADIUS_MM   = CYLINDER_DIAMETER_MM / 2.0
 
@@ -43,7 +43,7 @@ FRAME_GAP_MM     = 2.0
 CAP_DIAMETER_MM    = 2.0 * FRAME_INSET_MM   # = 10.0 mm with inset 5
 COLLAR_DIAMETER_MM = CAP_DIAMETER_MM
 # Collar stubs: cylinders from sphere centre toward each rod (3 per corner).
-CAP_LENGTH_MM      =  4.0   # length of each stub along its axis (mm)
+CAP_LENGTH_MM      =  5.0   # length of each stub along its axis (mm)
 
 # ── Ou: rounded bounding-box outline ────────────────────────────────────────
 # Corner fillet = FRAME_INSET_MM (same as recess / cap radius). Colour only here.
@@ -81,10 +81,23 @@ CU_CLEARANCE_FROM_HS_OUTER_MM = 0.5   # gap inside Hs outer pipe ID (mm)
 CU_PIPE_WALL_THICKNESS_MM     = 1.0   # copper shell thickness (mm)
 CU_PIPE_EXTENSION_MM          = 0.5   # extra length inward beyond Hs inner pipe (mm)
 CU_SITE_SPACING_MM            = 1.0   # FEA sample spacing inside copper volume (mm)
-CU_COLOR_POSITIVE             = (1.00, 0.72, 0.12)   # JS arrow: +current (bright on dark bg)
-CU_COLOR_NEGATIVE             = (0.35, 0.88, 1.00)   # JS arrow: −current
-# Signed face amplitude (+Z,-Z,+X,-X,+Y,-Y): scales |I| and circulation sign.
-CU_FACE_AMPLITUDE             = (1.0, -1.0, 0.85, -0.85, 1.0, -1.0)
+# ── Coil arrows (Cu + Cv share the same palette in JS) ───────────────────────
+# Sign picks hue; |weight| from coil_init.py sets intensity (not grey).
+COIL_ARROW_COLOR_POSITIVE     = (1.00, 0.72, 0.12)   # warm amber, +current
+COIL_ARROW_COLOR_NEGATIVE     = (0.35, 0.88, 1.00)   # cyan, −current
+CU_COLOR_POSITIVE             = COIL_ARROW_COLOR_POSITIVE
+CU_COLOR_NEGATIVE             = COIL_ARROW_COLOR_NEGATIVE
+
+# ── Cv: edge coils (2 per skeleton edge, 24 total on cube) ───────────────────
+# Sleeve around each Cy rod end; gap is inset from corner along the edge.
+CV_GAP_FROM_CORNER_MM     = 5.5   # space from corner before coil starts (mm)
+CV_EXTEND_MM              = 5.0   # coil length along edge from gap (mm)
+CV_THICKNESS_MM           = 1.2   # radial thickness of coil band (mm)
+CV_CLEARANCE_FROM_ROD_MM  = 0.25  # gap outside Cy rod OD (mm)
+CV_SITE_SPACING_MM        = 1.0   # FEA sample spacing (mm)
+CV_COLOR_POSITIVE         = COIL_ARROW_COLOR_POSITIVE
+CV_COLOR_NEGATIVE         = COIL_ARROW_COLOR_NEGATIVE
+CV_DEFAULT_AMPLITUDE      = 1.0    # unused: weights come from coil_init.py
 
 # ── Scene scale ─────────────────────────────────────────────────────────────
 MM_TO_SCENE = 0.1   # 1 mm -> 0.1 Three.js scene units  (32 mm frame = 3.2 units)

@@ -180,6 +180,7 @@ const CAP_CAPACITY   = 300_000;
 const PLATE_CAPACITY =  60_000;
 const HS_CAPACITY    =  30_000;
 const CU_ARROW_MAX   =  12_000;
+const CV_ARROW_MAX   =  20_000;
 
 const _voxGeo = new THREE.BoxGeometry(1, 1, 1);
 
@@ -216,17 +217,23 @@ let _caEnabled   = true;
 let _plEnabled   = true;
 let _hsEnabled   = true;
 let _cuEnabled   = true;
-let _ouEnabled   = true;
-let _hoEnabled   = true;
+let _cvEnabled   = true;
+let _ouEnabled   = false;
+let _hoEnabled   = false;
 
 let _cylObjects   = [];
 let _capObjects   = [];
 let _plateObjects = [];
 let _hsObjects    = [];
 let _cuObjects    = [];
-let _cuReverse    = false;
 let _cuSendTimer  = null;
+let _coilWeights  = null;
+let _feaRunning   = false;
+let _cuFieldBase  = null;
+let _cvFieldBase  = null;
 let _cuArrowMesh  = null;
+let _cvArrowMesh  = null;
+let _cvObjects    = [];
 let _ouGroup      = null;
 let _hoGroup      = null;
 let _sceneVoxelSize = 0.05;
@@ -251,38 +258,45 @@ function fillInstanced(imesh, positions, vs) {
   imesh.instanceMatrix.needsUpdate = true;
 }
 
-// ─── Cu FEA field: instanced arrow glyphs (direction + amplitude → color) ───
-function clearCuArrows() {
-  if (!_cuArrowMesh) return;
-  scene.remove(_cuArrowMesh);
-  _cuArrowMesh.geometry.dispose();
-  _cuArrowMesh.material.dispose();
-  _cuArrowMesh = null;
+// ─── Cu / Cv FEA fields: instanced arrow glyphs ─────────────────────────────
+function _disposeArrowMesh(mesh) {
+  if (!mesh) return;
+  scene.remove(mesh);
+  mesh.geometry.dispose();
+  mesh.material.dispose();
 }
 
-function applyCuField(cu, vs) {
-  clearCuArrows();
-  if (!cu?.sites?.positions?.length) {
-    _cuObjects = [];
-    console.warn("[Cu] no sites in scene — restart python -u server.py after saving fea_model.py");
-    return;
-  }
+// Shared Cu/Cv palette: sign → hue, |weight| → intensity (keeps chroma, not grey).
+const _coilColPos = new THREE.Color(1.0, 0.72, 0.12);
+const _coilColNeg = new THREE.Color(0.35, 0.88, 1.0);
+const COIL_INTENSITY_FLOOR = 0.32;
 
-  const pos = cu.sites.positions;
-  const dir = cu.sites.directions;
-  const amp = cu.sites.amplitudes;
-  const n   = Math.min(pos.length, dir.length, amp.length, CU_ARROW_MAX);
-  const [pr, pg, pb] = cu.color_positive ?? [0.95, 0.55, 0.15];
-  const [nr, ng, nb] = cu.color_negative ?? [0.30, 0.60, 1.00];
-  const colPos = new THREE.Color(pr, pg, pb);
-  const colNeg = new THREE.Color(nr, ng, nb);
+function _setCoilPalette(posRgb, negRgb) {
+  if (posRgb) _coilColPos.setRGB(posRgb[0], posRgb[1], posRgb[2]);
+  if (negRgb) _coilColNeg.setRGB(negRgb[0], negRgb[1], negRgb[2]);
+}
 
-  // Arrows must be much larger than voxel cubes (vs ≈ 0.05) to be visible
+function _coilArrowColor(a) {
+  const t = Math.min(1, Math.abs(a));
+  const inten = COIL_INTENSITY_FLOOR + (1 - COIL_INTENSITY_FLOOR) * t;
+  _cuCol.copy(a >= 0 ? _coilColPos : _coilColNeg).multiplyScalar(inten);
+  return _cuCol;
+}
+
+function _applyCurrentArrows(field, vs, maxCount, renderOrder, logTag, feaScale = 1.0) {
+  if (!field?.sites?.positions?.length) return null;
+
+  const pos = field.sites.positions;
+  const dir = field.sites.directions;
+  const amp = field.sites.amplitudes;
+  const scale = _feaRunning ? feaScale : 1.0;
+  const n   = Math.min(pos.length, dir.length, amp.length, maxCount);
+  _setCoilPalette(field.color_positive, field.color_negative);
+
   const baseLen = Math.max(0.18, vs * 4.0);
   const baseRad = baseLen * 0.28;
   const geo = new THREE.ConeGeometry(baseRad, baseLen, 8);
   geo.translate(0, baseLen * 0.5, 0);
-  // instanceColor via setColorAt (not geometry vertexColors); toneMapped off for dark bg
   const mat = new THREE.MeshBasicMaterial({
     toneMapped: false,
     transparent: false,
@@ -293,7 +307,7 @@ function applyCuField(cu, vs) {
   mat.userData.ignoreOpacity = true;
   const mesh = new THREE.InstancedMesh(geo, mat, n);
   mesh.frustumCulled = false;
-  mesh.renderOrder = 50;
+  mesh.renderOrder = renderOrder;
 
   let count = 0;
   for (let i = 0; i < n; i++) {
@@ -302,7 +316,6 @@ function applyCuField(cu, vs) {
     _cuDir.normalize();
 
     _dummy.position.set(pos[i][0], pos[i][1], pos[i][2]);
-
     _cuQuat.setFromUnitVectors(_cuUp, _cuDir);
     if (Number.isNaN(_cuQuat.x)) {
       _dummy.quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
@@ -310,26 +323,70 @@ function applyCuField(cu, vs) {
       _dummy.quaternion.copy(_cuQuat);
     }
 
-    const a   = amp[i];
-    const mag = Math.min(2, Math.abs(a));
-    const s   = 0.65 + 0.35 * (mag / 2);
+    const a   = amp[i] * scale;
+    const mag = Math.min(1, Math.abs(a));
+    const s   = 0.55 + 0.45 * mag;
     _dummy.scale.set(s, s, s);
     _dummy.updateMatrix();
     mesh.setMatrixAt(count, _dummy.matrix);
-    const bright = 0.75 + 0.25 * Math.min(1, mag / 2);
-    _cuCol.copy(a >= 0 ? colPos : colNeg).multiplyScalar(bright);
-    mesh.setColorAt(count, _cuCol);
+    mesh.setColorAt(count, _coilArrowColor(a));
     count++;
   }
   mesh.count = count;
   mesh.instanceMatrix.needsUpdate = true;
   if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  mat.opacity = 1;
-  mat.transparent = false;
   scene.add(mesh);
-  _cuArrowMesh = mesh;
+  console.info(`[${logTag}] ${count} current arrows`);
+  return mesh;
+}
+
+function clearCuArrows() {
+  _disposeArrowMesh(_cuArrowMesh);
+  _cuArrowMesh = null;
+}
+
+function clearCvArrows() {
+  _disposeArrowMesh(_cvArrowMesh);
+  _cvArrowMesh = null;
+}
+
+function _cloneCoilField(field) {
+  if (!field?.sites) return null;
+  return {
+    ...field,
+    sites: {
+      positions: field.sites.positions,
+      directions: field.sites.directions,
+      amplitudes: field.sites.amplitudes?.slice() ?? [],
+    },
+  };
+}
+
+function refreshCoilArrows(vs = _sceneVoxelSize) {
+  if (_cuFieldBase) applyCuField(_cuFieldBase, vs);
+  if (_cvFieldBase) applyCvField(_cvFieldBase, vs);
+}
+
+function applyCuField(cu, vs, feaScale = 1.0) {
+  clearCuArrows();
+  if (!cu?.sites?.positions?.length) {
+    _cuObjects = [];
+    console.warn("[Cu] no sites — restart python -u server.py");
+    return;
+  }
+  _cuArrowMesh = _applyCurrentArrows(cu, vs, CU_ARROW_MAX, 50, "Cu", feaScale);
   _cuObjects = cu.objects ?? [];
-  console.info(`[Cu] ${count} current arrows (toggle Cu in checklist)`);
+}
+
+function applyCvField(cv, vs, feaScale = 1.0) {
+  clearCvArrows();
+  if (!cv?.sites?.positions?.length) {
+    _cvObjects = [];
+    console.warn("[Cv] no sites — restart python -u server.py");
+    return;
+  }
+  _cvArrowMesh = _applyCurrentArrows(cv, vs, CV_ARROW_MAX, 51, "Cv", feaScale);
+  _cvObjects = cv.objects ?? [];
 }
 
 // ─── Build Ou / Ho Three.js display objects ───────────────────────────────────
@@ -391,29 +448,8 @@ function buildOuHo(fc) {
 }
 
 // ─── Checklist ────────────────────────────────────────────────────────────────
-function buildChecklist(hasPlates, hasHs, hasCu, hasOuHo) {
-  const cl = document.getElementById("scene-checklist");
-  if (!cl) return;
-  cl.innerHTML = "";
-
-  const items = [
-    { label: "Cy", get: () => _cyEnabled, set: v => { _cyEnabled = v; applyView(); } },
-    { label: "Ca", get: () => _caEnabled, set: v => { _caEnabled = v; applyView(); } },
-  ];
-  if (hasPlates) items.push(
-    { label: "Pl", get: () => _plEnabled, set: v => { _plEnabled = v; applyView(); } }
-  );
-  if (hasHs) items.push(
-    { label: "Hs", get: () => _hsEnabled, set: v => { _hsEnabled = v; applyView(); } }
-  );
-  if (hasCu) items.push(
-    { label: "Cu", get: () => _cuEnabled, set: v => { _cuEnabled = v; applyView(); } }
-  );
-  if (hasOuHo) items.push(
-    { label: "Ou", get: () => _ouEnabled, set: v => { _ouEnabled = v; applyView(); } },
-    { label: "Ho", get: () => _hoEnabled, set: v => { _hoEnabled = v; applyView(); } }
-  );
-
+function _appendChecklistItems(rowEl, items) {
+  if (!rowEl) return;
   for (const item of items) {
     const div = document.createElement("div");
     div.className = "cl-item";
@@ -425,8 +461,44 @@ function buildChecklist(hasPlates, hasHs, hasCu, hasOuHo) {
     lbl.textContent = item.label;
     div.appendChild(cb);
     div.appendChild(lbl);
-    cl.appendChild(div);
+    rowEl.appendChild(div);
   }
+}
+
+function buildChecklist(hasPlates, hasHs, hasCu, hasCv, hasOuHo) {
+  const row1 = document.getElementById("scene-checklist-row1");
+  const row2 = document.getElementById("scene-checklist-row2");
+  if (!row1 || !row2) return;
+  row1.innerHTML = "";
+  row2.innerHTML = "";
+
+  const line1 = [
+    { label: "Cy", get: () => _cyEnabled, set: v => { _cyEnabled = v; applyView(); } },
+    { label: "Ca", get: () => _caEnabled, set: v => { _caEnabled = v; applyView(); } },
+  ];
+  if (hasPlates) {
+    line1.push({ label: "Pl", get: () => _plEnabled, set: v => { _plEnabled = v; applyView(); } });
+  }
+  if (hasHs) {
+    line1.push({ label: "Hs", get: () => _hsEnabled, set: v => { _hsEnabled = v; applyView(); } });
+  }
+
+  const line2 = [];
+  if (hasCu) {
+    line2.push({ label: "Cu", get: () => _cuEnabled, set: v => { _cuEnabled = v; applyView(); } });
+  }
+  if (hasCv) {
+    line2.push({ label: "Cv", get: () => _cvEnabled, set: v => { _cvEnabled = v; applyView(); } });
+  }
+  if (hasOuHo) {
+    line2.push(
+      { label: "Ou", get: () => _ouEnabled, set: v => { _ouEnabled = v; applyView(); } },
+      { label: "Ho", get: () => _hoEnabled, set: v => { _hoEnabled = v; applyView(); } },
+    );
+  }
+
+  _appendChecklistItems(row1, line1);
+  _appendChecklistItems(row2, line2);
 }
 
 // ─── View visibility ──────────────────────────────────────────────────────────
@@ -437,6 +509,7 @@ function applyView() {
   plateMesh.visible = isCyl && _plEnabled;
   hsMesh.visible    = isCyl && _hsEnabled;
   if (_cuArrowMesh) _cuArrowMesh.visible = isCyl && _cuEnabled;
+  if (_cvArrowMesh) _cvArrowMesh.visible = isCyl && _cvEnabled;
   if (_ouGroup) _ouGroup.visible = isCyl && _ouEnabled;
   if (_hoGroup) _hoGroup.visible = isCyl && _hoEnabled;
 
@@ -483,15 +556,33 @@ function applyVoxelScene(data) {
     _hsObjects = [];
   }
 
-  if (data.cu) applyCuField(data.cu, vs);
-  else clearCuArrows();
+  _coilWeights = data.coil?.weights ?? data.frame_config?.coil_weights ?? null;
+  _setCoilPalette(data.coil?.color_positive, data.coil?.color_negative);
+  _feaRunning = false;
+
+  if (data.cu) {
+    _cuFieldBase = _cloneCoilField(data.cu);
+    applyCuField(data.cu, vs);
+  } else {
+    _cuFieldBase = null;
+    clearCuArrows();
+  }
+
+  if (data.cv) {
+    _cvFieldBase = _cloneCoilField(data.cv);
+    applyCvField(data.cv, vs);
+  } else {
+    _cvFieldBase = null;
+    clearCvArrows();
+  }
 
   _cubeCorners = data.frame_config?.cube_corners ?? null;
   _buildPickAnchors(data);
 
   if (data.frame_config) buildOuHo(data.frame_config);
-  buildChecklist(!!data.plates, !!data.hs, !!data.cu, !!data.frame_config);
+  buildChecklist(!!data.plates, !!data.hs, !!data.cu, !!data.cv, !!data.frame_config);
   applyView();
+  applyOpacityFromSlider();
 }
 
 // ─── Apply spinning-cubes frame from Python ───────────────────────────────────
@@ -515,22 +606,20 @@ function applyFrame(data) {
 // ─── WebSocket client ──────────────────────────────────────────────────────────
 let _ws = null;
 
-function sendUIState(includeCu = false) {
+function sendUIState() {
   if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
   const spin     = parseFloat(document.getElementById("spin-slider")?.value     ?? 0.8);
   const damping  = parseFloat(document.getElementById("damp-slider")?.value     ?? 0.985);
   const strength = parseFloat(document.getElementById("strength-slider")?.value ?? 0.4);
-  const payload  = { type: "ui_state", spin, damping, strength };
-  if (includeCu) {
-    payload.cu_scale   = strength;
-    payload.cu_reverse = _cuReverse;
-  }
-  _ws.send(JSON.stringify(payload));
+  _ws.send(JSON.stringify({ type: "ui_state", spin, damping, strength }));
+  if (_feaRunning) refreshCoilArrows(_sceneVoxelSize);
 }
 
-function scheduleCuRebuild() {
-  if (_cuSendTimer) clearTimeout(_cuSendTimer);
-  _cuSendTimer = setTimeout(() => sendUIState(true), 350);
+function sendFeaStart() {
+  if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
+  const strength = parseFloat(document.getElementById("strength-slider")?.value ?? 0.4);
+  _feaRunning = true;
+  _ws.send(JSON.stringify({ type: "fea_start", strength }));
 }
 
 function sendView(view) {
@@ -583,6 +672,7 @@ function _objectsForMesh(mesh) {
   if (mesh === hsMesh) return _hsObjects;
   if (mesh === plateMesh) return _plateObjects;
   if (mesh === _cuArrowMesh) return _cuObjects;
+  if (mesh === _cvArrowMesh) return _cvObjects;
   return null;
 }
 
@@ -668,6 +758,7 @@ function _directedEdgeLabel(obj, hitPoint) {
 
 function _hoverLabel(mesh, obj, hitPoint) {
   if (mesh === capMesh) return _cornerLabel(obj);
+  if (mesh === _cvArrowMesh) return obj.edge ?? obj.label;
   if (mesh === voxelMesh && obj.corners) return _directedEdgeLabel(obj, hitPoint);
   if (mesh === plateMesh || mesh === hsMesh) {
     const face = obj.face ?? (obj.label?.match(/^F(\d{4})$/)?.[1]);
@@ -683,11 +774,11 @@ function _hoverLabel(mesh, obj, hitPoint) {
 function _frontVisibleHit(hits) {
   if (!hits.length) return null;
   const front = hits[0];
-  if (front.object !== _cuArrowMesh) return front;
+  if (front.object !== _cuArrowMesh && front.object !== _cvArrowMesh) return front;
   const slack = Math.max(_sceneVoxelSize * 2, 0.04);
   for (let i = 1; i < hits.length; i++) {
     const h = hits[i];
-    if (h.object === _cuArrowMesh) continue;
+    if (h.object === _cuArrowMesh || h.object === _cvArrowMesh) continue;
     if (h.distance <= front.distance + slack) return h;
     break;
   }
@@ -746,7 +837,7 @@ window.addEventListener("mousemove", e => {
   _mouseBase.x = (e.clientX / window.innerWidth) * 2 - 1;
   _mouseBase.y = -(e.clientY / window.innerHeight) * 2 + 1;
 
-  const meshes = [capMesh, voxelMesh, hsMesh, plateMesh, _cuArrowMesh]
+  const meshes = [capMesh, voxelMesh, hsMesh, plateMesh, _cuArrowMesh, _cvArrowMesh]
     .filter(m => m && m.visible && m.count > 0);
 
   if (!meshes.length) {
@@ -795,26 +886,29 @@ function bindSlider(id, valId, decimals, cb) {
 
 bindSlider("spin-slider",     "spin-val",     1, () => sendUIState(false));
 bindSlider("damp-slider",     "damp-val",     3, () => sendUIState(false));
-bindSlider("strength-slider", "strength-val", 2, () => scheduleCuRebuild());
+bindSlider("strength-slider", "strength-val", 2, () => sendUIState());
 
 const _opSlider = document.getElementById("opacity-slider");
+function applyOpacityFromSlider() {
+  if (!_opSlider) return;
+  const op  = parseFloat(_opSlider.value);
+  const opV = document.getElementById("opacity-val");
+  if (opV) opV.textContent = op.toFixed(2);
+  voxelMat.opacity  = op;
+  capMat.opacity    = op;
+  plateMat.opacity  = op;
+  hsMat.opacity     = op;
+  // Cu/Cv arrows: always full brightness (not affected by opacity slider)
+  if (_ouGroup?.userData.ouSolid)
+    _ouGroup.userData.ouSolid.material.opacity = Math.max(0.02, op * 0.08);
+  if (_hoGroup?.userData.hoSolidMat)
+    _hoGroup.userData.hoSolidMat.opacity = Math.max(0.02, op * 0.08);
+  if (_hoGroup?.userData.hoWireMat)
+    _hoGroup.userData.hoWireMat.opacity = Math.max(0.02, op * 0.6);
+}
 if (_opSlider) {
-  _opSlider.addEventListener("input", () => {
-    const op  = parseFloat(_opSlider.value);
-    const opV = document.getElementById("opacity-val");
-    if (opV) opV.textContent = op.toFixed(2);
-    voxelMat.opacity  = op;
-    capMat.opacity    = op;
-    plateMat.opacity  = op;
-    hsMat.opacity     = op;
-    // Cu arrows: always full brightness (not affected by opacity slider)
-    if (_ouGroup?.userData.ouSolid)
-      _ouGroup.userData.ouSolid.material.opacity = Math.max(0.02, op * 0.08);
-    if (_hoGroup?.userData.hoSolidMat)
-      _hoGroup.userData.hoSolidMat.opacity = Math.max(0.02, op * 0.08);
-    if (_hoGroup?.userData.hoWireMat)
-      _hoGroup.userData.hoWireMat.opacity = Math.max(0.02, op * 0.6);
-  });
+  _opSlider.addEventListener("input", applyOpacityFromSlider);
+  applyOpacityFromSlider();
 }
 
 const _viewSelect = document.getElementById("view-select");
@@ -827,10 +921,6 @@ if (_viewSelect) {
 }
 
 document.getElementById("restart-btn")?.addEventListener("click", () => sendUIState(false));
-document.getElementById("cu-reverse-cb")?.addEventListener("change", e => {
-  _cuReverse = e.target.checked;
-  scheduleCuRebuild();
-});
 
 // ─── Coil texture updates (spinning-cubes view) ───────────────────────────────
 let _lastTexUpdate = 0;
