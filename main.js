@@ -30,6 +30,7 @@ controls.screenSpacePanning = true;
 controls.minDistance      = 1.5;
 controls.maxDistance      = 60;
 controls.target.set(0, 0, 0);
+controls.addEventListener("change", schedulePeelRefresh);
 controls.mouseButtons = {
   LEFT:   THREE.MOUSE.ROTATE,
   MIDDLE: THREE.MOUSE.DOLLY,
@@ -179,6 +180,7 @@ const VOXEL_CAPACITY = 200_000;
 const CAP_CAPACITY   = 300_000;
 const PLATE_CAPACITY =  60_000;
 const HS_CAPACITY    =  30_000;
+const GM_CAPACITY    = 300_000;
 const CU_ARROW_MAX   =  12_000;
 const CV_ARROW_MAX   =  20_000;
 
@@ -204,11 +206,17 @@ const voxelMesh = new THREE.InstancedMesh(_voxGeo, voxelMat, VOXEL_CAPACITY);
 const capMesh   = new THREE.InstancedMesh(_voxGeo, capMat,   CAP_CAPACITY);
 const plateMesh = new THREE.InstancedMesh(_voxGeo, plateMat, PLATE_CAPACITY);
 const hsMesh    = new THREE.InstancedMesh(_voxGeo, hsMat,    HS_CAPACITY);
-voxelMesh.count = capMesh.count = plateMesh.count = hsMesh.count = 0;
+const gmMat = new THREE.MeshStandardMaterial({
+  color: 0x55cc66, metalness: 0.35, roughness: 0.5,
+  transparent: true, opacity: 1.0,
+});
+const gmMesh    = new THREE.InstancedMesh(_voxGeo, gmMat, GM_CAPACITY);
+voxelMesh.count = capMesh.count = plateMesh.count = hsMesh.count = gmMesh.count = 0;
 scene.add(voxelMesh);
 scene.add(capMesh);
 scene.add(plateMesh);
 scene.add(hsMesh);
+scene.add(gmMesh);
 
 // ─── View state ────────────────────────────────────────────────────────────────
 let _currentView = "cylinder";
@@ -218,6 +226,8 @@ let _plEnabled   = true;
 let _hsEnabled   = true;
 let _cuEnabled   = true;
 let _cvEnabled   = true;
+let _gmEnabled   = false;
+let _cmEnabled   = false;
 let _ouEnabled   = false;
 let _hoEnabled   = false;
 
@@ -233,10 +243,21 @@ let _cuFieldBase  = null;
 let _cvFieldBase  = null;
 let _cuArrowMesh  = null;
 let _cvArrowMesh  = null;
+let _cmArrowMesh  = null;
+let _cmFieldBase  = null;
 let _cvObjects    = [];
+/** Cm: copper grid J arrows (debug; default off). */
+const CM_ARROW_MAX = 50_000;
+const _cmDebugCol = new THREE.Color(0.95, 0.72, 0.15);
 let _ouGroup      = null;
 let _hoGroup      = null;
 let _sceneVoxelSize = 0.05;
+/** Slightly >1 so box faces overlap (removes grid-line gaps, esp. with transparency). */
+const VOXEL_FILL = 1.03;
+let _peelCamDist = 0;
+let _peelRaf = 0;
+const _camWorld = new THREE.Vector3();
+const _posCache = { cyl: null, cap: null, pl: null, hs: null, gm: null };
 
 const _cuUp   = new THREE.Vector3(0, 1, 0);
 const _cuDir  = new THREE.Vector3();
@@ -246,16 +267,57 @@ const _cuQuat   = new THREE.Quaternion();
 // ─── Fill InstancedMesh from position array ───────────────────────────────────
 const _dummy = new THREE.Object3D();
 
-function fillInstanced(imesh, positions, vs) {
-  const n = Math.min(positions.length, imesh.instanceMatrix.count);
-  for (let i = 0; i < n; i++) {
-    _dummy.position.set(positions[i][0], positions[i][1], positions[i][2]);
-    _dummy.scale.setScalar(vs);
-    _dummy.updateMatrix();
-    imesh.setMatrixAt(i, _dummy.matrix);
+function fillInstanced(imesh, positions, vs, minDistFromCam = 0) {
+  const cap = imesh.instanceMatrix.count;
+  const scale = vs * VOXEL_FILL;
+  let j = 0;
+  if (minDistFromCam > 0) {
+    camera.getWorldPosition(_camWorld);
+    const cx = _camWorld.x;
+    const cy = _camWorld.y;
+    const cz = _camWorld.z;
+    for (let i = 0; i < positions.length && j < cap; i++) {
+      const p = positions[i];
+      const dx = p[0] - cx;
+      const dy = p[1] - cy;
+      const dz = p[2] - cz;
+      if (dx * dx + dy * dy + dz * dz < minDistFromCam * minDistFromCam) continue;
+      _dummy.position.set(p[0], p[1], p[2]);
+      _dummy.scale.setScalar(scale);
+      _dummy.updateMatrix();
+      imesh.setMatrixAt(j++, _dummy.matrix);
+    }
+  } else {
+    const n = Math.min(positions.length, cap);
+    for (let i = 0; i < n; i++) {
+      _dummy.position.set(positions[i][0], positions[i][1], positions[i][2]);
+      _dummy.scale.setScalar(scale);
+      _dummy.updateMatrix();
+      imesh.setMatrixAt(i, _dummy.matrix);
+    }
+    j = n;
   }
-  imesh.count = n;
+  imesh.count = j;
   imesh.instanceMatrix.needsUpdate = true;
+}
+
+function refreshVoxelMeshes() {
+  const vs = _sceneVoxelSize;
+  const peel = _peelCamDist;
+  if (_posCache.cyl) fillInstanced(voxelMesh, _posCache.cyl, vs, peel);
+  if (_posCache.cap) fillInstanced(capMesh, _posCache.cap, vs, peel);
+  if (_posCache.pl) fillInstanced(plateMesh, _posCache.pl, vs, peel);
+  if (_posCache.hs) fillInstanced(hsMesh, _posCache.hs, vs, peel);
+  if (_posCache.gm) fillInstanced(gmMesh, _posCache.gm, vs, peel);
+}
+
+function schedulePeelRefresh() {
+  if (_peelCamDist <= 0) return;
+  if (_peelRaf) return;
+  _peelRaf = requestAnimationFrame(() => {
+    _peelRaf = 0;
+    refreshVoxelMeshes();
+  });
 }
 
 // ─── Cu / Cv FEA fields: instanced arrow glyphs ─────────────────────────────
@@ -348,6 +410,87 @@ function clearCuArrows() {
 function clearCvArrows() {
   _disposeArrowMesh(_cvArrowMesh);
   _cvArrowMesh = null;
+}
+
+/** Instanced cones on fea_grid coil cells (Cu + Cv); direction from J (uniform debug color). */
+function _applyCmGridArrows(coil, vs) {
+  if (!coil?.positions?.length || !coil?.J?.length) return null;
+
+  const pos = coil.positions;
+  const J   = coil.J;
+  const n   = Math.min(pos.length, J.length, CM_ARROW_MAX);
+
+  const baseLen = Math.max(vs * 3.5, 0.14);
+  const baseRad = baseLen * 0.24;
+  const geo = new THREE.ConeGeometry(baseRad, baseLen, 6);
+  geo.translate(0, baseLen * 0.5, 0);
+  const mat = new THREE.MeshBasicMaterial({
+    toneMapped: false,
+    transparent: false,
+    depthTest: true,
+    depthWrite: true,
+  });
+  mat.userData.ignoreOpacity = true;
+  const mesh = new THREE.InstancedMesh(geo, mat, n);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 12;
+
+  let count = 0;
+  for (let i = 0; i < n; i++) {
+    const jx = J[i][0];
+    const jy = J[i][1];
+    const jz = J[i][2];
+    const mag = Math.hypot(jx, jy, jz);
+    if (mag < 1e-8) continue;
+    _cuDir.set(jx / mag, jy / mag, jz / mag);
+
+    _dummy.position.set(pos[i][0], pos[i][1], pos[i][2]);
+    _cuQuat.setFromUnitVectors(_cuUp, _cuDir);
+    if (Number.isNaN(_cuQuat.x)) {
+      _dummy.quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
+    } else {
+      _dummy.quaternion.copy(_cuQuat);
+    }
+
+    const s = 0.5 + 0.25 * Math.min(1, mag / 1.5);
+    _dummy.scale.set(s, s, s);
+    _dummy.updateMatrix();
+    mesh.setMatrixAt(count, _dummy.matrix);
+    mesh.setColorAt(count, _cmDebugCol);
+    count++;
+  }
+  mesh.count = count;
+  mesh.instanceMatrix.needsUpdate = true;
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  scene.add(mesh);
+  if (count < n) {
+    console.warn(`[Cm] showing ${count.toLocaleString()} / ${n.toLocaleString()} (raise CM_ARROW_MAX)`);
+  } else {
+    console.info(`[Cm] ${count.toLocaleString()} coil-grid J arrows (Cu + Cv)`);
+  }
+  return mesh;
+}
+
+function clearCmArrows() {
+  _disposeArrowMesh(_cmArrowMesh);
+  _cmArrowMesh = null;
+}
+
+function clearCmField() {
+  clearCmArrows();
+  _cmFieldBase = null;
+}
+
+function rebuildCmArrows(vs) {
+  clearCmArrows();
+  if (!_cmFieldBase) return;
+  _cmArrowMesh = _applyCmGridArrows(_cmFieldBase, vs);
+  updateCmVisibility();
+}
+
+function updateCmVisibility() {
+  if (!_cmArrowMesh) return;
+  _cmArrowMesh.visible = _currentView === "cylinder" && _cmEnabled;
 }
 
 function _cloneCoilField(field) {
@@ -459,13 +602,14 @@ function _appendChecklistItems(rowEl, items) {
     cb.addEventListener("change", () => item.set(cb.checked));
     const lbl = document.createElement("label");
     lbl.textContent = item.label;
+    if (item.title) div.title = item.title;
     div.appendChild(cb);
     div.appendChild(lbl);
     rowEl.appendChild(div);
   }
 }
 
-function buildChecklist(hasPlates, hasHs, hasCu, hasCv, hasOuHo) {
+function buildChecklist(hasPlates, hasHs, hasCu, hasCv, hasGm, hasCm, hasOuHo) {
   const row1 = document.getElementById("scene-checklist-row1");
   const row2 = document.getElementById("scene-checklist-row2");
   if (!row1 || !row2) return;
@@ -484,6 +628,21 @@ function buildChecklist(hasPlates, hasHs, hasCu, hasCv, hasOuHo) {
   }
 
   const line2 = [];
+  if (hasGm) {
+    line2.push({ label: "Gm", get: () => _gmEnabled, set: v => { _gmEnabled = v; applyView(); } });
+  }
+  if (hasCm) {
+    line2.push({
+      label: "Cm",
+      title: "Coil grid J (debug): Cu pipes + Cv edge sleeves; zoom to edges",
+      get: () => _cmEnabled,
+      set: v => {
+        _cmEnabled = v;
+        if (v && _cmFieldBase && !_cmArrowMesh) rebuildCmArrows(_sceneVoxelSize);
+        applyView();
+      },
+    });
+  }
   if (hasCu) {
     line2.push({ label: "Cu", get: () => _cuEnabled, set: v => { _cuEnabled = v; applyView(); } });
   }
@@ -510,6 +669,8 @@ function applyView() {
   hsMesh.visible    = isCyl && _hsEnabled;
   if (_cuArrowMesh) _cuArrowMesh.visible = isCyl && _cuEnabled;
   if (_cvArrowMesh) _cvArrowMesh.visible = isCyl && _cvEnabled;
+  gmMesh.visible    = isCyl && _gmEnabled;
+  updateCmVisibility();
   if (_ouGroup) _ouGroup.visible = isCyl && _ouEnabled;
   if (_hoGroup) _hoGroup.visible = isCyl && _hoEnabled;
 
@@ -524,36 +685,53 @@ function applyVoxelScene(data) {
   const vs = data.voxel_size;
   _sceneVoxelSize = vs;
 
+  _posCache.cyl = data.cylinders.positions;
+  _posCache.cap = data.caps.positions;
+  _posCache.pl  = data.plates?.positions ?? null;
+  _posCache.hs  = data.hs?.positions ?? null;
+  _posCache.gm  = data.fea_grid?.metal?.positions ?? null;
+
   const cc = data.cylinders.color;
   voxelMat.color.setRGB(cc[0], cc[1], cc[2]);
-  fillInstanced(voxelMesh, data.cylinders.positions, vs);
   _cylObjects = data.cylinders.objects;
 
   const cc2 = data.caps.color;
   capMat.color.setRGB(cc2[0], cc2[1], cc2[2]);
-  fillInstanced(capMesh, data.caps.positions, vs);
   _capObjects = data.caps.objects;
 
   if (data.plates) {
     const pc = data.plates.color;
     plateMat.color.setRGB(pc[0], pc[1], pc[2]);
-    fillInstanced(plateMesh, data.plates.positions, vs);
     _plateObjects = data.plates.objects;
   } else {
-    plateMesh.count = 0;
-    plateMesh.instanceMatrix.needsUpdate = true;
     _plateObjects = [];
   }
 
   if (data.hs) {
     const hc = data.hs.color;
     hsMat.color.setRGB(hc[0], hc[1], hc[2]);
-    fillInstanced(hsMesh, data.hs.positions, vs);
     _hsObjects = data.hs.objects;
   } else {
-    hsMesh.count = 0;
-    hsMesh.instanceMatrix.needsUpdate = true;
     _hsObjects = [];
+  }
+
+  if (data.fea_grid?.metal?.positions?.length) {
+    const gc = data.fea_grid.color ?? [0.35, 0.85, 0.45];
+    gmMat.color.setRGB(gc[0], gc[1], gc[2]);
+  }
+
+  refreshVoxelMeshes();
+
+  if (data.fea_grid?.metal?.cell_count) {
+    if (gmMesh.count < data.fea_grid.metal.cell_count) {
+      console.warn(
+        `[Gm] showing ${gmMesh.count.toLocaleString()} / ${data.fea_grid.metal.cell_count.toLocaleString()} union cells (raise GM_CAPACITY)`
+      );
+    } else if (_posCache.gm) {
+      console.info(
+        `[Gm] ${gmMesh.count.toLocaleString()} union metal cells (raw ${data.fea_grid.metal.sources?.raw_total?.toLocaleString() ?? "?"})`
+      );
+    }
   }
 
   _coilWeights = data.coil?.weights ?? data.frame_config?.coil_weights ?? null;
@@ -576,13 +754,36 @@ function applyVoxelScene(data) {
     clearCvArrows();
   }
 
+  const coilCells = data.fea_grid?.cells?.coil ?? data.fea_grid?.cells?.copper;
+  if (coilCells?.positions?.length && coilCells.J?.length) {
+    _cmFieldBase = {
+      positions: coilCells.positions,
+      J: coilCells.J,
+      weight: coilCells.weight ?? [],
+      color_positive: data.cu?.color_positive ?? data.coil?.color_positive,
+      color_negative: data.cu?.color_negative ?? data.coil?.color_negative,
+    };
+    if (_cmEnabled) rebuildCmArrows(vs);
+  } else {
+    clearCmField();
+  }
+
   _cubeCorners = data.frame_config?.cube_corners ?? null;
   _buildPickAnchors(data);
 
   if (data.frame_config) buildOuHo(data.frame_config);
-  buildChecklist(!!data.plates, !!data.hs, !!data.cu, !!data.cv, !!data.frame_config);
+  buildChecklist(
+    !!data.plates,
+    !!data.hs,
+    !!data.cu,
+    !!data.cv,
+    !!data.fea_grid,
+    !!(coilCells?.positions?.length),
+    !!data.frame_config,
+  );
   applyView();
   applyOpacityFromSlider();
+  applyMetalOpacityFromSlider();
 }
 
 // ─── Apply spinning-cubes frame from Python ───────────────────────────────────
@@ -837,7 +1038,7 @@ window.addEventListener("mousemove", e => {
   _mouseBase.x = (e.clientX / window.innerWidth) * 2 - 1;
   _mouseBase.y = -(e.clientY / window.innerHeight) * 2 + 1;
 
-  const meshes = [capMesh, voxelMesh, hsMesh, plateMesh, _cuArrowMesh, _cvArrowMesh]
+  const meshes = [capMesh, voxelMesh, hsMesh, plateMesh, gmMesh, _cuArrowMesh, _cvArrowMesh, _cmArrowMesh]
     .filter(m => m && m.visible && m.count > 0);
 
   if (!meshes.length) {
@@ -889,6 +1090,8 @@ bindSlider("damp-slider",     "damp-val",     3, () => sendUIState(false));
 bindSlider("strength-slider", "strength-val", 2, () => sendUIState());
 
 const _opSlider = document.getElementById("opacity-slider");
+const _metalOpSlider = document.getElementById("metal-opacity-slider");
+
 function applyOpacityFromSlider() {
   if (!_opSlider) return;
   const op  = parseFloat(_opSlider.value);
@@ -898,7 +1101,7 @@ function applyOpacityFromSlider() {
   capMat.opacity    = op;
   plateMat.opacity  = op;
   hsMat.opacity     = op;
-  // Cu/Cv arrows: always full brightness (not affected by opacity slider)
+  // Cu/Cv arrows: always full brightness (not affected by opacity sliders)
   if (_ouGroup?.userData.ouSolid)
     _ouGroup.userData.ouSolid.material.opacity = Math.max(0.02, op * 0.08);
   if (_hoGroup?.userData.hoSolidMat)
@@ -906,9 +1109,35 @@ function applyOpacityFromSlider() {
   if (_hoGroup?.userData.hoWireMat)
     _hoGroup.userData.hoWireMat.opacity = Math.max(0.02, op * 0.6);
 }
+
+function applyMetalOpacityFromSlider() {
+  if (!_metalOpSlider) return;
+  const op  = parseFloat(_metalOpSlider.value);
+  const opV = document.getElementById("metal-opacity-val");
+  if (opV) opV.textContent = op.toFixed(2);
+  gmMat.opacity = op;
+}
+
 if (_opSlider) {
   _opSlider.addEventListener("input", applyOpacityFromSlider);
   applyOpacityFromSlider();
+}
+if (_metalOpSlider) {
+  _metalOpSlider.addEventListener("input", applyMetalOpacityFromSlider);
+  applyMetalOpacityFromSlider();
+}
+
+const _peelSlider = document.getElementById("peel-slider");
+function applyPeelFromSlider() {
+  if (!_peelSlider) return;
+  _peelCamDist = parseFloat(_peelSlider.value);
+  const peelV = document.getElementById("peel-val");
+  if (peelV) peelV.textContent = _peelCamDist.toFixed(2);
+  refreshVoxelMeshes();
+}
+if (_peelSlider) {
+  _peelSlider.addEventListener("input", applyPeelFromSlider);
+  applyPeelFromSlider();
 }
 
 const _viewSelect = document.getElementById("view-select");
@@ -948,6 +1177,7 @@ function tick(now) {
   requestAnimationFrame(tick);
   maybeRedrawTextures(now);
   controls.update();
+  updateCmVisibility();
   renderer.render(scene, camera);
 }
 tick(performance.now());

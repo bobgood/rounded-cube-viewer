@@ -99,5 +99,17 @@ CV_COLOR_POSITIVE         = COIL_ARROW_COLOR_POSITIVE
 CV_COLOR_NEGATIVE         = COIL_ARROW_COLOR_NEGATIVE
 CV_DEFAULT_AMPLITUDE      = 1.0    # unused: weights come from coil_init.py
 
+# ── FEA voxel grid (world space) ─────────────────────────────────────────────
+FEA_GRID_PAD_MM           = 0.5
+FEA_METAL_MATERIAL_ID     = 1     # structural steel (Cy/Ca/Pl/Hs)
+FEA_METAL_MU_R            = 5000.0
+FEA_COIL_MATERIAL_ID      = 2     # Cu + Cv on grid (conductors); mu_r like air
+FEA_COIL_MU_R             = 1.0
+FEA_CURRENT_NOM_A_MM2     = 1.0   # |J| = |coil_weight| × this (A/mm²); sign from weight
+# Legacy aliases
+FEA_COPPER_MATERIAL_ID    = FEA_COIL_MATERIAL_ID
+FEA_COPPER_MU_R           = FEA_COIL_MU_R
+FEA_GRID_DEBUG_COLOR      = (0.35, 0.85, 0.45)   # Gm steel debug view
+
 # ── Scene scale ─────────────────────────────────────────────────────────────
 MM_TO_SCENE = 0.1   # 1 mm -> 0.1 Three.js scene units  (32 mm frame = 3.2 units)

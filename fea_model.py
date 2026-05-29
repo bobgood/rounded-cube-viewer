@@ -27,6 +27,7 @@ Scene message format
                   "sites": { "positions", "directions", "amplitudes" },
                   "color_positive", "color_negative" }
   "cv":        { "objects", "sites": { ... }, "color_positive", "color_negative" }
+  "fea_grid":  { origin, size, metal (Gm steel debug), cells { steel, copper + J_mm } }
 }
 Each "objects" list: [{"id":"cy0","label":"E12","start":0,"count":N}, ...]
 Cube (n=4): corners C1–C8, edges E12, faces F1234 (clockwise corner ids).
@@ -81,9 +82,17 @@ from fea_config import (
     CV_COLOR_NEGATIVE,
     CV_DEFAULT_AMPLITUDE,
     MM_TO_SCENE,
+    FEA_GRID_PAD_MM,
+    FEA_METAL_MATERIAL_ID,
+    FEA_METAL_MU_R,
+    FEA_COIL_MATERIAL_ID,
+    FEA_COIL_MU_R,
+    FEA_CURRENT_NOM_A_MM2,
+    FEA_GRID_DEBUG_COLOR,
 )
 
 from coil_init import cu_coil_weight, cv_coil_key, cv_coil_weight, export_coil_table
+from fea_grid import build_fea_grid
 
 
 # ── Cube topology labels (FRAME_SIDES == 4 only) ─────────────────────────────
@@ -189,22 +198,48 @@ def _sphere_voxels(radius_mm, step=VOXEL_SIZE_MM):
     return voxels
 
 
+def _lattice_centers_along_axis(lo: float, hi: float, step: float) -> list[float]:
+    """Voxel centres k*step whose cubes intersect [lo, hi] (same lattice as cylinders)."""
+    if lo >= hi or step <= 0:
+        return []
+    k = int(math.ceil((lo - step / 2) / step))
+    out: list[float] = []
+    while True:
+        c = k * step
+        if c - step / 2 > hi + 1e-9:
+            break
+        if c + step / 2 >= lo - 1e-9:
+            out.append(c)
+        k += 1
+    return out
+
+
+def _lattice_centers_thickness(thickness: float, step: float) -> list[float]:
+    """Centres k*step along W from 0 (outer face) inward to thickness."""
+    if thickness <= 0 or step <= 0:
+        return []
+    k = 0
+    out: list[float] = []
+    while True:
+        c = k * step
+        if c - step / 2 > thickness + 1e-9:
+            break
+        if c + step / 2 <= thickness + 1e-9:
+            out.append(c)
+        k += 1
+    return out
+
+
 def _box_voxels(u_lo, u_hi, v_lo, v_hi, thickness, step=VOXEL_SIZE_MM):
     """Rectangular slab in UV-space; W axis runs from 0 (outer) to thickness (inward)."""
     if u_lo >= u_hi or v_lo >= v_hi or thickness <= 0:
         return []
-    nu = max(1, int((u_hi - u_lo) / step))
-    nv = max(1, int((v_hi - v_lo) / step))
-    nt = max(1, int(thickness     / step))
-    voxels = []
-    for iu in range(nu):
-        u = u_lo + (iu + 0.5) * (u_hi - u_lo) / nu
-        for iv in range(nv):
-            v = v_lo + (iv + 0.5) * (v_hi - v_lo) / nv
-            for it in range(nt):
-                w = (it + 0.5) * thickness / nt
-                voxels.append((u, v, w))
-    return voxels
+    us = _lattice_centers_along_axis(u_lo, u_hi, step)
+    vs = _lattice_centers_along_axis(v_lo, v_hi, step)
+    ws = _lattice_centers_thickness(thickness, step)
+    if not us or not vs or not ws:
+        return []
+    return [(u, v, w) for u in us for v in vs for w in ws]
 
 
 def _rotate_z(voxels, angle):
@@ -258,11 +293,14 @@ def _annulus_disk_voxels(axis, r_outer_mm, r_inner_mm, thickness_mm, step=VOXEL_
     r_outer_sq = r_outer_mm ** 2
     r_inner_sq = r_inner_mm ** 2
     half_t = thickness_mm / 2.0
-    n_t = max(1, int(thickness_mm / step))
     n_r = int(r_outer_mm / step)
+    t_vals = [
+        kt * step
+        for kt in range(-int(math.ceil(half_t / step)), int(math.ceil(half_t / step)) + 1)
+        if abs(kt * step) + step / 2 <= half_t + 1e-9
+    ]
     raw = []
-    for it in range(n_t):
-        t = (it + 0.5) * thickness_mm / n_t - half_t
+    for t in t_vals:
         for iy in range(-n_r, n_r + 1):
             u = iy * step
             for iz in range(-n_r, n_r + 1):
@@ -346,6 +384,46 @@ def _cu_coil_sample_points(axis, face_coord, length_mm, r_coil):
             else:
                 pts.append((axial, r_coil * c, r_coil * s))
     return pts
+
+
+def _translate_cu_pipe_voxels(axis: str, face_coord: float, length_mm: float, voxels: list) -> list:
+    """Place +X annulus template on a cube face (same layout as Hs pipes)."""
+    half_l = length_mm / 2.0
+    inward = -math.copysign(1.0, face_coord)
+    pipe_ctr = face_coord + inward * half_l
+    inner_w = _voxels_to_axis(voxels, axis)
+    if axis == "x":
+        return _translate(inner_w, pipe_ctr, 0.0, 0.0)
+    if axis == "y":
+        return _translate(inner_w, 0.0, pipe_ctr, 0.0)
+    return _translate(inner_w, 0.0, 0.0, pipe_ctr)
+
+
+def _build_cu_face_voxels(axis, face_coord, coil_weight, hs_length_mm, extension_mm):
+    """Copper pipe volume on the FEA lattice with current density J (A/mm²)."""
+    if abs(coil_weight) < 1e-9:
+        return []
+    r_in, r_out, _, _ = _cu_pipe_radii_mm()
+    if r_out <= r_in:
+        return []
+
+    sign = 1.0 if coil_weight >= 0 else -1.0
+    j_scale = abs(float(coil_weight)) * FEA_CURRENT_NOM_A_MM2
+    length = hs_length_mm + extension_mm
+    pipe = _annulus_cylinder_voxels_x(length, r_out, r_in)
+    world = _translate_cu_pipe_voxels(axis, face_coord, length, pipe)
+
+    out = []
+    for (x, y, z) in world:
+        tx, ty, tz = _tangent_around_axis(axis, x, y, z, sign)
+        if tx == ty == tz == 0.0:
+            continue
+        out.append((
+            x, y, z,
+            tx * j_scale, ty * j_scale, tz * j_scale,
+            float(coil_weight),
+        ))
+    return out
 
 
 def _build_cu_face_field(axis, face_coord, coil_weight, hs_length_mm,
@@ -442,17 +520,19 @@ def _cv_tangent_ccw(u, px, py, pz, ax, ay, az, view_from_c1):
     return (sgn * tx / tl, sgn * ty / tl, sgn * tz / tl)
 
 
-def _sample_cv_coil_end(anchor, u, s_lo, s_hi, r_coil, amplitude, view_from_c1):
+def _sample_cv_coil_end(anchor, u, s_lo, s_hi, r_coil, amplitude, view_from_c1,
+                        site_spacing=None):
     """Samples on one coil sleeve at an edge end (anchor = corner end)."""
     if abs(amplitude) < 1e-6:
         return []
+    step = CV_SITE_SPACING_MM if site_spacing is None else site_spacing
     basis = _perp_basis(u)
     if basis is None:
         return []
     v, w = basis
     ux, uy, uz = u
-    n_along = max(1, int((s_hi - s_lo) / CV_SITE_SPACING_MM))
-    n_around = max(8, int(2.0 * math.pi * r_coil / CV_SITE_SPACING_MM))
+    n_along = max(1, int((s_hi - s_lo) / step))
+    n_around = max(8, int(2.0 * math.pi * r_coil / step))
     sign = 1.0 if view_from_c1 else -1.0
     sites = []
     for ia in range(n_along):
@@ -555,10 +635,83 @@ def _build_cv_edge_coils(vertices, half_h, weight_scale: float = 1.0):
     return pos_all, dir_all, amp_all, objects
 
 
+def _build_cv_coil_voxels(anchor, u, s_lo, s_hi, coil_weight, view_from_c1):
+    """Cv sleeve volume on the FEA lattice (filled band, not a single sample ring)."""
+    w = float(coil_weight)
+    if abs(w) < 1e-9:
+        return []
+    step = VOXEL_SIZE_MM
+    basis = _perp_basis(u)
+    if basis is None:
+        return []
+    v, wv = basis
+    ux, uy, uz = u
+    sign_edge = 1.0 if view_from_c1 else -1.0
+    j_scale = abs(w) * FEA_CURRENT_NOM_A_MM2
+    j_sign = 1.0 if w >= 0 else -1.0
+    r_in = CYLINDER_RADIUS_MM + CV_CLEARANCE_FROM_ROD_MM
+    r_out = r_in + CV_THICKNESS_MM
+    r_in_sq = r_in * r_in
+    r_out_sq = r_out * r_out
+    n_r = int(r_out / step) + 1
+
+    out = []
+    for s_mm in _lattice_centers_along_axis(s_lo, s_hi, step):
+        ax = anchor[0] + sign_edge * ux * s_mm
+        ay = anchor[1] + sign_edge * uy * s_mm
+        az = anchor[2] + sign_edge * uz * s_mm
+        for iy in range(-n_r, n_r + 1):
+            oy = iy * step
+            for iz in range(-n_r, n_r + 1):
+                oz = iz * step
+                r2 = oy * oy + oz * oz
+                if r2 <= r_in_sq or r2 > r_out_sq:
+                    continue
+                px = ax + oy * v[0] + oz * wv[0]
+                py = ay + oy * v[1] + oz * wv[1]
+                pz = az + oy * v[2] + oz * wv[2]
+                tx, ty, tz = _cv_tangent_ccw(u, px, py, pz, ax, ay, az, view_from_c1)
+                tl = math.sqrt(tx * tx + ty * ty + tz * tz)
+                if tl < 1e-9:
+                    continue
+                s = j_sign * j_scale / tl
+                out.append((px, py, pz, tx * s, ty * s, tz * s, w))
+    return out
+
+
+def _build_cv_edge_coil_voxels(vertices, half_h, weight_scale: float = 1.0) -> list:
+    """All Cv edge coils as (x, y, z, jx, jy, jz, coil_weight) for the FEA grid."""
+    gap = CV_GAP_FROM_CORNER_MM
+    ext = CV_EXTEND_MM
+    out: list = []
+
+    def _display(w: float) -> float:
+        return max(-1.0, min(1.0, float(w) * float(weight_scale)))
+
+    for c1, c2, p1, p2 in _iter_cube_edges(vertices, half_h):
+        axis = _edge_axis(p1, p2)
+        if axis is None:
+            continue
+        u, length = axis
+        if length < 2.0 * gap + ext + 0.5:
+            continue
+        ends = (
+            (p1, True,  c1, c2, f"E{c1}{c2}"),
+            (p2, False, c2, c1, f"E{c2}{c1}"),
+        )
+        for anchor, from_c1, near_c, far_c, label in ends:
+            weight = _display(cv_coil_weight(near_c, label))
+            if abs(weight) < 1e-6:
+                continue
+            out.extend(_build_cv_coil_voxels(
+                anchor, u, gap, gap + ext, weight, from_c1,
+            ))
+    return out
+
+
 def _build_hs_face_voxels(axis, face_coord, length_mm, r_inner_od, r_outer_od,
-                          wall_mm, washer_t_mm, outer_edge_mm, outer_height_mm,
-                          ou_round_mm):
-    """Coaxial pipes + back washer on one face, opening inward from face_coord."""
+                          wall_mm, washer_t_mm):
+    """Coaxial pipes + back washer on one face (no Ou/Ho subtraction — plates only)."""
     r_io = r_inner_od / 2.0
     r_ii = r_io - wall_mm
     r_oo = r_outer_od / 2.0
@@ -593,15 +746,7 @@ def _build_hs_face_voxels(axis, face_coord, length_mm, r_inner_od, r_outer_od,
             out.extend(_translate(part, 0.0, 0.0, pipe_ctr))
         out.extend(_translate(washer_w, 0.0, 0.0, washer_ctr))
 
-    kept = []
-    for (x, y, z) in out:
-        if _inside_rounded_box(
-            x, y, z,
-            outer_edge_mm / 2.0, outer_height_mm / 2.0, outer_edge_mm / 2.0,
-            ou_round_mm,
-        ):
-            kept.append((x, y, z))
-    return kept
+    return out
 
 
 def _inside_rounded_box(x, y, z, hx, hy, hz, r):
@@ -695,7 +840,8 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
     """Build (or return cached) the complete voxel scene dict.
 
     Coil colors/intensities come from coil_init.COIL (not fea_config).
-    fea_strength_scale multiplies coil weights when FEA is running (default 1).
+    fea_strength_scale multiplies every coil_init weight before J is filled on the
+    grid (fea_start / Strength slider → server rebuilds scene with scaled weights).
     """
     global _scene_cache
     if _scene_cache is not None and not force and fea_strength_scale == 1.0:
@@ -857,7 +1003,7 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
         g  = PLATE_GAP_MM / 2.0
         d  = SPIN_WHEEL_OFFSET_MM
         pe = PLATE_EDGE_INSET_MM
-        # Plates on outer faces; clipped to Ou rounded box, Ho subtracted (Cy/Ca unchanged).
+        # Plates on outer faces; Ou/Ho clip here only (Cy/Ca/Hs unclipped; metal union uses this list).
         h  = E / 2.0 - pe
         hz = H / 2.0 - pe
         ou_r = ins
@@ -934,7 +1080,6 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
                 HS_LENGTH_MM,
                 HS_INNER_PIPE_OD_MM, HS_OUTER_PIPE_OD_MM,
                 wt, HS_WASHER_THICKNESS_MM,
-                E, H, ou_r,
             ))
             count = len(hs_raw) - start
             if count > 0:
@@ -946,7 +1091,8 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
                     "count": count,
                 })
 
-        # Cu: FEA current sites in fixed pipe (not metal voxels; arrows drawn in JS)
+        # Cu + Cv: coil voxels + J on FEA grid; arrow sites unchanged for display
+        coil_grid_voxels: list = []
         cu_pos:     list = []
         cu_dir:     list = []
         cu_amp:     list = []
@@ -964,6 +1110,9 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
             weight = max(-1.0, min(1.0, float(cu_coil_weight(face_str)) * fea_scale))
             if abs(weight) < 1e-6:
                 continue
+            coil_grid_voxels.extend(_build_cu_face_voxels(
+                axis, face_c, weight, HS_LENGTH_MM, CU_PIPE_EXTENSION_MM,
+            ))
             coil_key = f"f{face_str.lower()}"
             flbl = _cube_face_label(fi)
             start = len(cu_pos)
@@ -988,12 +1137,17 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
                     "amplitude": round(weight, 4),
                 })
 
+        coil_grid_voxels.extend(_build_cv_edge_coil_voxels(
+            vertices, half_h, weight_scale=fea_scale,
+        ))
+
         # Cv: edge coils (2 per Cy edge; arrows in JS)
         cv_pos, cv_dir, cv_amp, cv_objects = _build_cv_edge_coils(
             vertices, half_h, weight_scale=fea_scale,
         )
 
     else:
+        coil_grid_voxels = []
         hs_raw = []
         hs_objects = []
         cu_pos = []
@@ -1004,6 +1158,29 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
         cv_dir = []
         cv_amp = []
         cv_objects = []
+
+    fea_grid = None
+    if n == 4:
+        fea_grid = build_fea_grid(
+            cyl_raw, cap_raw, plate_raw, hs_raw,
+            coil_voxels=coil_grid_voxels,
+            outer_edge_mm=E,
+            outer_height_mm=H,
+            voxel_size_mm=VOXEL_SIZE_MM,
+            pad_mm=FEA_GRID_PAD_MM,
+            steel_material_id=FEA_METAL_MATERIAL_ID,
+            steel_mu_r=FEA_METAL_MU_R,
+            coil_material_id=FEA_COIL_MATERIAL_ID,
+            coil_mu_r=FEA_COIL_MU_R,
+        )
+        mg = fea_grid["metal"]
+        cells = fea_grid["cells"]
+        print(
+            f"[fea] FEA grid {fea_grid['size'][0]}×{fea_grid['size'][1]}×{fea_grid['size'][2]}  "
+            f"steel={cells['steel_count']:,}  coil+J={cells['coil_count']:,}  "
+            f"(grid samples {len(coil_grid_voxels):,})  "
+            f"raw_struct={mg['sources']['raw_total']:,}  skipped_oob={cells['skipped_oob']:,}"
+        )
 
     total = len(cyl_raw) + len(cap_raw) + len(plate_raw) + len(hs_raw)
     print(
@@ -1099,6 +1276,37 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
                 "directions":  [[round(a, 4), round(b, 4), round(c, 4)]
                                  for (a, b, c) in cv_dir],
                 "amplitudes":  [round(a, 4) for a in cv_amp],
+            },
+        }
+
+    if fea_grid and (
+        fea_grid["metal"]["cell_count"] > 0 or fea_grid["cells"]["coil_count"] > 0
+    ):
+        mg = fea_grid["metal"]
+        coil_cells = fea_grid["cells"]["coil"]
+        scene["fea_grid"] = {
+            "origin_mm":    fea_grid["origin_mm"],
+            "spacing_mm":   fea_grid["spacing_mm"],
+            "size":         fea_grid["size"],
+            "color":        list(FEA_GRID_DEBUG_COLOR),
+            "metal": {
+                "material_id": mg["material_id"],
+                "mu_r":          mg["mu_r"],
+                "cell_count":    mg["cell_count"],
+                "positions":     to_scene(mg["positions_mm"]),
+                "sources":       mg["sources"],
+            },
+            "cells": {
+                "steel_count": fea_grid["cells"]["steel_count"],
+                "coil_count":  fea_grid["cells"]["coil_count"],
+                "steel":       fea_grid["cells"]["steel"],
+                "coil": {
+                    "material_id": coil_cells["material_id"],
+                    "mu_r":          coil_cells["mu_r"],
+                    "positions":     to_scene(coil_cells["positions_mm"]),
+                    "J":             coil_cells["J_mm"],
+                    "weight":        coil_cells["weight"],
+                },
             },
         }
 

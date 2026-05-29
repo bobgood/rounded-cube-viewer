@@ -140,10 +140,22 @@
       </div>
 
       <!-- Transparency -->
-      <label>
-        Opacity
+      <label title="Cy, Ca, Pl, Hs voxel layers">
+        Parts
         <input type="range" id="opacity-slider" min="0" max="1" step="0.01" value="0.5">
         <span class="val" id="opacity-val">0.50</span>
+      </label>
+      <label title="Gm union metal grid">
+        Metal (Gm)
+        <input type="range" id="metal-opacity-slider" min="0" max="1" step="0.01" value="0.5">
+        <span class="val" id="metal-opacity-val">0.50</span>
+      </label>
+
+      <!-- Hide voxels near the camera (peel shell to see inside) -->
+      <label title="Hides voxels closer than this distance to the camera">
+        Peel (cam)
+        <input type="range" id="peel-slider" min="0" max="6.5" step="0.02" value="0">
+        <span class="val" id="peel-val">0.00</span>
       </label>
 
       <!-- Physics sliders (Python reads & can use or ignore) -->
@@ -169,7 +181,7 @@
     <!-- Hover label -->
     <div id="hover-info"></div>
 
-    <div id="hint">Left drag: orbit &nbsp;·&nbsp; Right drag: pan &nbsp;·&nbsp; Scroll: zoom</div>
+    <div id="hint">Peel (cam) &nbsp;·&nbsp; Gm/Cm = FEA debug &nbsp;·&nbsp; Cu/Cv = coil display</div>
 
     <script type="module" src="/main.js"></script>
   </body>
