@@ -178,6 +178,8 @@ const cubeModules = [createCubeModule(-1.2), createCubeModule(1.2)];
 const VOXEL_CAPACITY = 200_000;
 const CAP_CAPACITY   = 300_000;
 const PLATE_CAPACITY =  60_000;
+const HS_CAPACITY    =  30_000;
+const CU_ARROW_MAX   =  12_000;
 
 const _voxGeo = new THREE.BoxGeometry(1, 1, 1);
 
@@ -193,28 +195,46 @@ const plateMat = new THREE.MeshStandardMaterial({
   color: 0xffffff, metalness: 0.45, roughness: 0.45,
   transparent: true, opacity: 1.0,
 });
-
+const hsMat = new THREE.MeshStandardMaterial({
+  color: 0xffffff, metalness: 0.45, roughness: 0.45,
+  transparent: true, opacity: 1.0,
+});
 const voxelMesh = new THREE.InstancedMesh(_voxGeo, voxelMat, VOXEL_CAPACITY);
 const capMesh   = new THREE.InstancedMesh(_voxGeo, capMat,   CAP_CAPACITY);
 const plateMesh = new THREE.InstancedMesh(_voxGeo, plateMat, PLATE_CAPACITY);
-voxelMesh.count = capMesh.count = plateMesh.count = 0;
+const hsMesh    = new THREE.InstancedMesh(_voxGeo, hsMat,    HS_CAPACITY);
+voxelMesh.count = capMesh.count = plateMesh.count = hsMesh.count = 0;
 scene.add(voxelMesh);
 scene.add(capMesh);
 scene.add(plateMesh);
+scene.add(hsMesh);
 
 // ─── View state ────────────────────────────────────────────────────────────────
 let _currentView = "cylinder";
 let _cyEnabled   = true;
 let _caEnabled   = true;
 let _plEnabled   = true;
+let _hsEnabled   = true;
+let _cuEnabled   = true;
 let _ouEnabled   = true;
 let _hoEnabled   = true;
 
 let _cylObjects   = [];
 let _capObjects   = [];
 let _plateObjects = [];
+let _hsObjects    = [];
+let _cuObjects    = [];
+let _cuReverse    = false;
+let _cuSendTimer  = null;
+let _cuArrowMesh  = null;
 let _ouGroup      = null;
 let _hoGroup      = null;
+let _sceneVoxelSize = 0.05;
+
+const _cuUp   = new THREE.Vector3(0, 1, 0);
+const _cuDir  = new THREE.Vector3();
+const _cuCol  = new THREE.Color();
+const _cuQuat   = new THREE.Quaternion();
 
 // ─── Fill InstancedMesh from position array ───────────────────────────────────
 const _dummy = new THREE.Object3D();
@@ -229,6 +249,87 @@ function fillInstanced(imesh, positions, vs) {
   }
   imesh.count = n;
   imesh.instanceMatrix.needsUpdate = true;
+}
+
+// ─── Cu FEA field: instanced arrow glyphs (direction + amplitude → color) ───
+function clearCuArrows() {
+  if (!_cuArrowMesh) return;
+  scene.remove(_cuArrowMesh);
+  _cuArrowMesh.geometry.dispose();
+  _cuArrowMesh.material.dispose();
+  _cuArrowMesh = null;
+}
+
+function applyCuField(cu, vs) {
+  clearCuArrows();
+  if (!cu?.sites?.positions?.length) {
+    _cuObjects = [];
+    console.warn("[Cu] no sites in scene — restart python -u server.py after saving fea_model.py");
+    return;
+  }
+
+  const pos = cu.sites.positions;
+  const dir = cu.sites.directions;
+  const amp = cu.sites.amplitudes;
+  const n   = Math.min(pos.length, dir.length, amp.length, CU_ARROW_MAX);
+  const [pr, pg, pb] = cu.color_positive ?? [0.95, 0.55, 0.15];
+  const [nr, ng, nb] = cu.color_negative ?? [0.30, 0.60, 1.00];
+  const colPos = new THREE.Color(pr, pg, pb);
+  const colNeg = new THREE.Color(nr, ng, nb);
+
+  // Arrows must be much larger than voxel cubes (vs ≈ 0.05) to be visible
+  const baseLen = Math.max(0.18, vs * 4.0);
+  const baseRad = baseLen * 0.28;
+  const geo = new THREE.ConeGeometry(baseRad, baseLen, 8);
+  geo.translate(0, baseLen * 0.5, 0);
+  // instanceColor via setColorAt (not geometry vertexColors); toneMapped off for dark bg
+  const mat = new THREE.MeshBasicMaterial({
+    toneMapped: false,
+    transparent: false,
+    opacity: 1,
+    depthTest: true,
+    depthWrite: true,
+  });
+  mat.userData.ignoreOpacity = true;
+  const mesh = new THREE.InstancedMesh(geo, mat, n);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 50;
+
+  let count = 0;
+  for (let i = 0; i < n; i++) {
+    _cuDir.set(dir[i][0], dir[i][1], dir[i][2]);
+    if (_cuDir.lengthSq() < 1e-8) continue;
+    _cuDir.normalize();
+
+    _dummy.position.set(pos[i][0], pos[i][1], pos[i][2]);
+
+    _cuQuat.setFromUnitVectors(_cuUp, _cuDir);
+    if (Number.isNaN(_cuQuat.x)) {
+      _dummy.quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
+    } else {
+      _dummy.quaternion.copy(_cuQuat);
+    }
+
+    const a   = amp[i];
+    const mag = Math.min(2, Math.abs(a));
+    const s   = 0.65 + 0.35 * (mag / 2);
+    _dummy.scale.set(s, s, s);
+    _dummy.updateMatrix();
+    mesh.setMatrixAt(count, _dummy.matrix);
+    const bright = 0.75 + 0.25 * Math.min(1, mag / 2);
+    _cuCol.copy(a >= 0 ? colPos : colNeg).multiplyScalar(bright);
+    mesh.setColorAt(count, _cuCol);
+    count++;
+  }
+  mesh.count = count;
+  mesh.instanceMatrix.needsUpdate = true;
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  mat.opacity = 1;
+  mat.transparent = false;
+  scene.add(mesh);
+  _cuArrowMesh = mesh;
+  _cuObjects = cu.objects ?? [];
+  console.info(`[Cu] ${count} current arrows (toggle Cu in checklist)`);
 }
 
 // ─── Build Ou / Ho Three.js display objects ───────────────────────────────────
@@ -290,7 +391,7 @@ function buildOuHo(fc) {
 }
 
 // ─── Checklist ────────────────────────────────────────────────────────────────
-function buildChecklist(hasPlates, hasOuHo) {
+function buildChecklist(hasPlates, hasHs, hasCu, hasOuHo) {
   const cl = document.getElementById("scene-checklist");
   if (!cl) return;
   cl.innerHTML = "";
@@ -301,6 +402,12 @@ function buildChecklist(hasPlates, hasOuHo) {
   ];
   if (hasPlates) items.push(
     { label: "Pl", get: () => _plEnabled, set: v => { _plEnabled = v; applyView(); } }
+  );
+  if (hasHs) items.push(
+    { label: "Hs", get: () => _hsEnabled, set: v => { _hsEnabled = v; applyView(); } }
+  );
+  if (hasCu) items.push(
+    { label: "Cu", get: () => _cuEnabled, set: v => { _cuEnabled = v; applyView(); } }
   );
   if (hasOuHo) items.push(
     { label: "Ou", get: () => _ouEnabled, set: v => { _ouEnabled = v; applyView(); } },
@@ -328,6 +435,8 @@ function applyView() {
   voxelMesh.visible = isCyl && _cyEnabled;
   capMesh.visible   = isCyl && _caEnabled;
   plateMesh.visible = isCyl && _plEnabled;
+  hsMesh.visible    = isCyl && _hsEnabled;
+  if (_cuArrowMesh) _cuArrowMesh.visible = isCyl && _cuEnabled;
   if (_ouGroup) _ouGroup.visible = isCyl && _ouEnabled;
   if (_hoGroup) _hoGroup.visible = isCyl && _hoEnabled;
 
@@ -340,6 +449,7 @@ function applyView() {
 // ─── Apply voxel scene from Python ────────────────────────────────────────────
 function applyVoxelScene(data) {
   const vs = data.voxel_size;
+  _sceneVoxelSize = vs;
 
   const cc = data.cylinders.color;
   voxelMat.color.setRGB(cc[0], cc[1], cc[2]);
@@ -362,8 +472,25 @@ function applyVoxelScene(data) {
     _plateObjects = [];
   }
 
+  if (data.hs) {
+    const hc = data.hs.color;
+    hsMat.color.setRGB(hc[0], hc[1], hc[2]);
+    fillInstanced(hsMesh, data.hs.positions, vs);
+    _hsObjects = data.hs.objects;
+  } else {
+    hsMesh.count = 0;
+    hsMesh.instanceMatrix.needsUpdate = true;
+    _hsObjects = [];
+  }
+
+  if (data.cu) applyCuField(data.cu, vs);
+  else clearCuArrows();
+
+  _cubeCorners = data.frame_config?.cube_corners ?? null;
+  _buildPickAnchors(data);
+
   if (data.frame_config) buildOuHo(data.frame_config);
-  buildChecklist(!!data.plates, !!data.frame_config);
+  buildChecklist(!!data.plates, !!data.hs, !!data.cu, !!data.frame_config);
   applyView();
 }
 
@@ -388,12 +515,22 @@ function applyFrame(data) {
 // ─── WebSocket client ──────────────────────────────────────────────────────────
 let _ws = null;
 
-function sendUIState() {
+function sendUIState(includeCu = false) {
   if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
   const spin     = parseFloat(document.getElementById("spin-slider")?.value     ?? 0.8);
   const damping  = parseFloat(document.getElementById("damp-slider")?.value     ?? 0.985);
   const strength = parseFloat(document.getElementById("strength-slider")?.value ?? 0.4);
-  _ws.send(JSON.stringify({ type: "ui_state", spin, damping, strength }));
+  const payload  = { type: "ui_state", spin, damping, strength };
+  if (includeCu) {
+    payload.cu_scale   = strength;
+    payload.cu_reverse = _cuReverse;
+  }
+  _ws.send(JSON.stringify(payload));
+}
+
+function scheduleCuRebuild() {
+  if (_cuSendTimer) clearTimeout(_cuSendTimer);
+  _cuSendTimer = setTimeout(() => sendUIState(true), 350);
 }
 
 function sendView(view) {
@@ -404,7 +541,7 @@ function sendView(view) {
 function connectWS() {
   _ws = new WebSocket("ws://localhost:8765");
   _ws.addEventListener("open", () => {
-    sendUIState();
+    sendUIState(false);
     sendView(_currentView);
   });
   _ws.addEventListener("message", e => {
@@ -420,7 +557,18 @@ connectWS();
 // ─── Hover detection ──────────────────────────────────────────────────────────
 const _raycaster = new THREE.Raycaster();
 const _mouse     = new THREE.Vector2();
+const _mouseBase = new THREE.Vector2();
+const _edgeEndA  = new THREE.Vector3();
+const _edgeEndB  = new THREE.Vector3();
+const _pickCent  = new THREE.Vector3();
+const _pickScr   = new THREE.Vector3();
+const _RAY_JITTER = [
+  [0, 0], [-0.004, 0], [0.004, 0], [0, -0.004], [0, 0.004],
+  [-0.003, -0.003], [0.003, 0.003],
+];
 let   _lastHover = 0;
+let   _cubeCorners = null;
+let   _pickAnchors = [];
 
 function _findObject(objects, instanceId) {
   for (const obj of objects) {
@@ -429,32 +577,208 @@ function _findObject(objects, instanceId) {
   return null;
 }
 
+function _objectsForMesh(mesh) {
+  if (mesh === capMesh) return _capObjects;
+  if (mesh === voxelMesh) return _cylObjects;
+  if (mesh === hsMesh) return _hsObjects;
+  if (mesh === plateMesh) return _plateObjects;
+  if (mesh === _cuArrowMesh) return _cuObjects;
+  return null;
+}
+
+function _centroidFromRange(positions, start, count) {
+  _pickCent.set(0, 0, 0);
+  const end = Math.min(start + count, positions.length);
+  let n = 0;
+  for (let i = start; i < end; i++) {
+    _pickCent.x += positions[i][0];
+    _pickCent.y += positions[i][1];
+    _pickCent.z += positions[i][2];
+    n++;
+  }
+  if (n) _pickCent.divideScalar(n);
+  return _pickCent.clone();
+}
+
+function _buildPickAnchors(data) {
+  _pickAnchors = [];
+  const vs = data.voxel_size ?? _sceneVoxelSize;
+  const add = (positions, objects, mesh, radiusMul) => {
+    if (!positions?.length || !objects?.length) return;
+    const r = Math.max(vs * radiusMul, 0.35);
+    for (const obj of objects) {
+      _pickAnchors.push({
+        mesh,
+        obj,
+        center: _centroidFromRange(positions, obj.start, obj.count),
+        radius: r,
+      });
+    }
+  };
+  add(data.cylinders?.positions, data.cylinders?.objects, voxelMesh, 18);
+  add(data.caps?.positions, data.caps?.objects, capMesh, 20);
+  add(data.hs?.positions, data.hs?.objects, hsMesh, 22);
+  add(data.plates?.positions, data.plates?.objects, plateMesh, 16);
+}
+
+function _cornerLabel(obj) {
+  if (obj.corner != null) return `C${obj.corner}`;
+  const m = /^C?(\d+)$/.exec(obj.label ?? "");
+  return m ? `C${m[1]}` : obj.label;
+}
+
+function _cornerWorld(cornerId) {
+  const p = _cubeCorners?.[String(cornerId)];
+  if (!p) return null;
+  _edgeEndA.fromArray(p);
+  return _edgeEndA;
+}
+
+/** Face id with closest corner first: F1234 → F2341 when corner 2 is nearest. */
+function _faceLabelFromPoint(faceStr, hitPoint) {
+  const ids = [...faceStr].map(ch => parseInt(ch, 10));
+  if (ids.length !== 4 || ids.some(n => Number.isNaN(n))) return `F${faceStr}`;
+  let bestI = 0;
+  let bestD = Infinity;
+  for (let i = 0; i < ids.length; i++) {
+    const w = _cornerWorld(ids[i]);
+    if (!w) continue;
+    const d = hitPoint.distanceToSquared(w);
+    if (d < bestD) {
+      bestD = d;
+      bestI = i;
+    }
+  }
+  const rot = ids.slice(bestI).concat(ids.slice(0, bestI));
+  return `F${rot.join("")}`;
+}
+
+/** Closest corner first → E12 vs E21 for two coils per edge. */
+function _directedEdgeLabel(obj, hitPoint) {
+  if (!obj.corners || obj.corners.length !== 2 || !obj.ends || obj.ends.length !== 2) {
+    return obj.label;
+  }
+  const [c1, c2] = obj.corners;
+  _edgeEndA.fromArray(obj.ends[0]);
+  _edgeEndB.fromArray(obj.ends[1]);
+  const d1 = hitPoint.distanceToSquared(_edgeEndA);
+  const d2 = hitPoint.distanceToSquared(_edgeEndB);
+  return d1 <= d2 ? `E${c1}${c2}` : `E${c2}${c1}`;
+}
+
+function _hoverLabel(mesh, obj, hitPoint) {
+  if (mesh === capMesh) return _cornerLabel(obj);
+  if (mesh === voxelMesh && obj.corners) return _directedEdgeLabel(obj, hitPoint);
+  if (mesh === plateMesh || mesh === hsMesh) {
+    const face = obj.face ?? (obj.label?.match(/^F(\d{4})$/)?.[1]);
+    if (face) return _faceLabelFromPoint(face, hitPoint);
+  }
+  if (obj.label?.match(/^F\d{4}/)) {
+    const face = obj.label.slice(1, 5);
+    return _faceLabelFromPoint(face, hitPoint);
+  }
+  return obj.label;
+}
+
+function _frontVisibleHit(hits) {
+  if (!hits.length) return null;
+  const front = hits[0];
+  if (front.object !== _cuArrowMesh) return front;
+  const slack = Math.max(_sceneVoxelSize * 2, 0.04);
+  for (let i = 1; i < hits.length; i++) {
+    const h = hits[i];
+    if (h.object === _cuArrowMesh) continue;
+    if (h.distance <= front.distance + slack) return h;
+    break;
+  }
+  return front;
+}
+
+function _gatherVoxelHits(meshes, baseX, baseY) {
+  const all = [];
+  for (const [dx, dy] of _RAY_JITTER) {
+    _mouse.set(baseX + dx, baseY + dy);
+    _raycaster.setFromCamera(_mouse, camera);
+    all.push(..._raycaster.intersectObjects(meshes, false));
+  }
+  all.sort((a, b) => a.distance - b.distance);
+  return all;
+}
+
+function _rayParamAndPerp(center, ray) {
+  _pickScr.copy(center).sub(ray.origin);
+  const t = _pickScr.dot(ray.direction);
+  if (t < 0) return { t: -1, perp: Infinity };
+  _edgeEndB.copy(ray.direction).multiplyScalar(t);
+  const perp = _pickScr.sub(_edgeEndB).length();
+  return { t, perp };
+}
+
+/** Front-most anchor along ray (visible layers only); used when voxels are missed. */
+function _anchorPick(ray, mousePxX, mousePxY) {
+  let best = null;
+  let bestT = Infinity;
+  const pxLim = 32;
+  for (const a of _pickAnchors) {
+    if (!a.mesh?.visible || a.mesh.count === 0) continue;
+    const { t, perp } = _rayParamAndPerp(a.center, ray);
+    if (t < 0 || t >= bestT || perp > a.radius) continue;
+    _pickScr.copy(a.center).project(camera);
+    const sx = (_pickScr.x * 0.5 + 0.5) * window.innerWidth;
+    const sy = (-_pickScr.y * 0.5 + 0.5) * window.innerHeight;
+    const dx = sx - mousePxX;
+    const dy = sy - mousePxY;
+    if (dx * dx + dy * dy > pxLim * pxLim) continue;
+    bestT = t;
+    best = a;
+  }
+  return best;
+}
+
 window.addEventListener("mousemove", e => {
   const now = performance.now();
-  if (now - _lastHover < 50) return;   // ~20 fps throttle
+  if (now - _lastHover < 32) return;
   _lastHover = now;
 
   const hi = document.getElementById("hover-info");
   if (!hi) return;
 
-  _mouse.x =  (e.clientX / window.innerWidth)  * 2 - 1;
-  _mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
-  _raycaster.setFromCamera(_mouse, camera);
+  _mouseBase.x = (e.clientX / window.innerWidth) * 2 - 1;
+  _mouseBase.y = -(e.clientY / window.innerHeight) * 2 + 1;
 
-  const pairs = [
-    [voxelMesh, _cylObjects],
-    [capMesh,   _capObjects],
-    [plateMesh, _plateObjects],
-  ].filter(([m]) => m.visible && m.count > 0);
+  const meshes = [capMesh, voxelMesh, hsMesh, plateMesh, _cuArrowMesh]
+    .filter(m => m && m.visible && m.count > 0);
 
-  for (const [mesh, objects] of pairs) {
-    const hits = _raycaster.intersectObject(mesh);
-    if (hits.length > 0) {
-      const obj = _findObject(objects, hits[0].instanceId);
-      if (obj) { hi.textContent = obj.label; return; }
+  if (!meshes.length) {
+    hi.textContent = "";
+    return;
+  }
+
+  const hits = _gatherVoxelHits(meshes, _mouseBase.x, _mouseBase.y);
+  let mesh = null;
+  let obj = null;
+  let hitPoint = null;
+
+  const pick = _frontVisibleHit(hits);
+  if (pick) {
+    mesh = pick.object;
+    hitPoint = pick.point;
+    const objects = _objectsForMesh(mesh);
+    obj = objects ? _findObject(objects, pick.instanceId) : null;
+  }
+
+  if (!obj) {
+    _mouse.copy(_mouseBase);
+    _raycaster.setFromCamera(_mouse, camera);
+    const anchor = _anchorPick(_raycaster.ray, e.clientX, e.clientY);
+    if (anchor) {
+      mesh = anchor.mesh;
+      obj = anchor.obj;
+      hitPoint = anchor.center;
     }
   }
-  hi.textContent = "";
+
+  hi.textContent = obj && mesh ? _hoverLabel(mesh, obj, hitPoint) : "";
 });
 
 // ─── UI controls ──────────────────────────────────────────────────────────────
@@ -469,9 +793,9 @@ function bindSlider(id, valId, decimals, cb) {
   });
 }
 
-bindSlider("spin-slider",     "spin-val",     1, () => sendUIState());
-bindSlider("damp-slider",     "damp-val",     3, () => sendUIState());
-bindSlider("strength-slider", "strength-val", 2, () => sendUIState());
+bindSlider("spin-slider",     "spin-val",     1, () => sendUIState(false));
+bindSlider("damp-slider",     "damp-val",     3, () => sendUIState(false));
+bindSlider("strength-slider", "strength-val", 2, () => scheduleCuRebuild());
 
 const _opSlider = document.getElementById("opacity-slider");
 if (_opSlider) {
@@ -482,6 +806,8 @@ if (_opSlider) {
     voxelMat.opacity  = op;
     capMat.opacity    = op;
     plateMat.opacity  = op;
+    hsMat.opacity     = op;
+    // Cu arrows: always full brightness (not affected by opacity slider)
     if (_ouGroup?.userData.ouSolid)
       _ouGroup.userData.ouSolid.material.opacity = Math.max(0.02, op * 0.08);
     if (_hoGroup?.userData.hoSolidMat)
@@ -500,7 +826,11 @@ if (_viewSelect) {
   });
 }
 
-document.getElementById("restart-btn")?.addEventListener("click", () => sendUIState());
+document.getElementById("restart-btn")?.addEventListener("click", () => sendUIState(false));
+document.getElementById("cu-reverse-cb")?.addEventListener("change", e => {
+  _cuReverse = e.target.checked;
+  scheduleCuRebuild();
+});
 
 // ─── Coil texture updates (spinning-cubes view) ───────────────────────────────
 let _lastTexUpdate = 0;

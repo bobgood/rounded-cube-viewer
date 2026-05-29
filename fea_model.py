@@ -4,6 +4,8 @@ Generates a regular n-gon prism frame:
   - 3n cylinder rods
   - 2n corner caps  — sphere + 3 collar stubs (CAP_LENGTH_MM from centre)
   - 6 plate faces   — 4 spin-wheel quadrant panels per face (n=4 only)
+  - 6 Hs assemblies — coaxial hole pipes + back washer per face (n=4 only)
+  - 6 Cu FEA fields — fixed pipe volume + per-site current dir/amp (n=4; arrows in JS)
 
 FRAME_EDGE_MM  is the outer envelope. Cylinder rods sit on
 an inset skeleton (see _skeleton_dims). Caps, plates, and Ou may still use
@@ -19,8 +21,13 @@ Scene message format
   "cylinders": { "color", "objects", "positions" },
   "caps":      { "color", "objects", "positions" },
   "plates":    { "color", "objects", "positions" }   # omitted for n != 4
+  "hs":        { "color", "objects", "positions" }   # omitted for n != 4
+  "cu":        { "face_amplitudes", "objects",
+                  "sites": { "positions", "directions", "amplitudes" },
+                  "color_positive", "color_negative" }
 }
-Each "objects" list: [{"id":"cy0","label":"Cy 0","start":0,"count":N}, ...]
+Each "objects" list: [{"id":"cy0","label":"E12","start":0,"count":N}, ...]
+Cube (n=4): corners C1–C8, edges E12, faces F1234 (clockwise corner ids).
 Plate ids use the format  F{face}{quad}  e.g. "F0A", "F3C".
 """
 
@@ -48,8 +55,85 @@ from fea_config import (
     OU_COLOR,
     HOLE_DIAMETER_MM,
     HO_COLOR,
+    HS_INNER_PIPE_OD_MM,
+    HS_OUTER_PIPE_OD_MM,
+    HS_WALL_THICKNESS_MM,
+    HS_LENGTH_MM,
+    HS_WASHER_THICKNESS_MM,
+    HS_COLOR,
+    CU_CLEARANCE_FROM_HS_INNER_MM,
+    CU_CLEARANCE_FROM_HS_OUTER_MM,
+    CU_PIPE_WALL_THICKNESS_MM,
+    CU_PIPE_EXTENSION_MM,
+    CU_SITE_SPACING_MM,
+    CU_COLOR_POSITIVE,
+    CU_COLOR_NEGATIVE,
+    CU_FACE_AMPLITUDE,
     MM_TO_SCENE,
 )
+
+
+# ── Cube topology labels (FRAME_SIDES == 4 only) ─────────────────────────────
+# +Z face viewed from outside: corners 1,2,3,4 clockwise at vertices k0,k3,k2,k1.
+# Bottom face: 5–8 at the same k indices.  Edge Eab connects corners a and b.
+
+_CUBE_CORNER_BY_K_TOP = (1, 4, 3, 2)
+
+_CUBE_FACE_CLOCKWISE = (
+    "1234",  # +Z
+    "5678",  # -Z
+    "1265",  # +X
+    "3487",  # -X
+    "1485",  # +Y
+    "3276",  # -Y
+)
+
+
+def _cube_corner(k: int, z_sign: int) -> int:
+    c = _CUBE_CORNER_BY_K_TOP[k % 4]
+    return c if z_sign > 0 else c + 4
+
+
+def _scene_point(x_mm: float, y_mm: float, z_mm: float, sc: float) -> list:
+    return [round(x_mm * sc, 3), round(y_mm * sc, 3), round(z_mm * sc, 3)]
+
+
+def _cube_ring_edge_label(k: int, z_sign: int) -> str:
+    """Directed along polygon edge k → (k+1); reverse name is the other end (e.g. E14 / E41)."""
+    c1 = _cube_corner(k, z_sign)
+    c2 = _cube_corner((k + 1) % 4, z_sign)
+    return f"E{c1}{c2}"
+
+
+def _cube_strut_edge_label(k: int) -> str:
+    """Top corner → bottom corner (e.g. E15; opposite end E51)."""
+    return f"E{_cube_corner(k, +1)}{_cube_corner(k, -1)}"
+
+
+def _cube_face_label(face_index: int) -> str:
+    return "F" + _CUBE_FACE_CLOCKWISE[face_index]
+
+
+def _cube_corner_positions_mm(vertices, half_h: float) -> dict:
+    pos: dict = {}
+    for k in range(4):
+        vx, vy = vertices[k]
+        c = _CUBE_CORNER_BY_K_TOP[k]
+        pos[c] = (vx, vy, half_h)
+        pos[c + 4] = (vx, vy, -half_h)
+    return pos
+
+
+def _closest_corner(face_corner_ids, corner_pos_mm, x, y, z) -> int:
+    best_c = face_corner_ids[0]
+    best_d = float("inf")
+    for c in face_corner_ids:
+        cx, cy, cz = corner_pos_mm[c]
+        d = (x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2
+        if d < best_d:
+            best_d = d
+            best_c = c
+    return best_c
 
 
 # ── Primitive voxel generators ───────────────────────────────────────────────
@@ -117,6 +201,224 @@ def _rotate_z(voxels, angle):
 
 def _translate(voxels, dx, dy, dz):
     return [(x + dx, y + dy, z + dz) for (x, y, z) in voxels]
+
+
+def _annulus_cylinder_voxels_x(length_mm, r_outer_mm, r_inner_mm, step=VOXEL_SIZE_MM):
+    """Hollow cylinder wall along +X (inner radius exclusive, outer inclusive)."""
+    if r_inner_mm >= r_outer_mm or length_mm <= 0:
+        return []
+    r_outer_sq = r_outer_mm ** 2
+    r_inner_sq = r_inner_mm ** 2
+    half_l = length_mm / 2.0
+    n_l = int(half_l / step)
+    n_r = int(r_outer_mm / step)
+    voxels = []
+    for ix in range(-n_l, n_l + 1):
+        x = ix * step
+        if abs(x) > half_l:
+            continue
+        for iy in range(-n_r, n_r + 1):
+            y = iy * step
+            for iz in range(-n_r, n_r + 1):
+                z = iz * step
+                r2 = y * y + z * z
+                if r_inner_sq < r2 <= r_outer_sq:
+                    voxels.append((x, y, z))
+    return voxels
+
+
+def _voxels_to_axis(voxels, axis):
+    """Map +X-axis template to +X, +Y, or +Z world axis."""
+    if axis == "x":
+        return voxels
+    if axis == "y":
+        return [(z, x, y) for (x, y, z) in voxels]
+    if axis == "z":
+        return [(y, z, x) for (x, y, z) in voxels]
+    raise ValueError(f"unknown axis {axis!r}")
+
+
+def _annulus_disk_voxels(axis, r_outer_mm, r_inner_mm, thickness_mm, step=VOXEL_SIZE_MM):
+    """Annular washer disk in the plane perpendicular to axis (centred at origin)."""
+    if r_inner_mm >= r_outer_mm or thickness_mm <= 0:
+        return []
+    r_outer_sq = r_outer_mm ** 2
+    r_inner_sq = r_inner_mm ** 2
+    half_t = thickness_mm / 2.0
+    n_t = max(1, int(thickness_mm / step))
+    n_r = int(r_outer_mm / step)
+    raw = []
+    for it in range(n_t):
+        t = (it + 0.5) * thickness_mm / n_t - half_t
+        for iy in range(-n_r, n_r + 1):
+            u = iy * step
+            for iz in range(-n_r, n_r + 1):
+                v = iz * step
+                r2 = u * u + v * v
+                if r_inner_sq < r2 <= r_outer_sq:
+                    raw.append((t, u, v))
+    return _voxels_to_axis(raw, axis)
+
+
+def _normalize3(vx, vy, vz):
+    ln = math.sqrt(vx * vx + vy * vy + vz * vz)
+    if ln < 1e-9:
+        return (0.0, 0.0, 0.0)
+    return (vx / ln, vy / ln, vz / ln)
+
+
+def _hs_pipe_radii_mm():
+    """Hs inner/outer pipe radii (mm): inner OD, outer ID, outer OD."""
+    wt = HS_WALL_THICKNESS_MM
+    r_io = HS_INNER_PIPE_OD_MM / 2.0
+    r_oo = HS_OUTER_PIPE_OD_MM / 2.0
+    r_oi = r_oo - wt
+    return r_io, r_oi, r_oo
+
+
+def _cu_pipe_radii_mm():
+    """Copper shell outside Hs inner OD, capped before Hs outer pipe ID."""
+    r_io, r_oi, _r_oo = _hs_pipe_radii_mm()
+    gap_in = CU_CLEARANCE_FROM_HS_INNER_MM
+    gap_out = CU_CLEARANCE_FROM_HS_OUTER_MM
+    r_in = r_io + gap_in
+    r_out = min(r_in + CU_PIPE_WALL_THICKNESS_MM, r_oi - gap_out)
+    if r_out <= r_in:
+        r_out = r_in + max(VOXEL_SIZE_MM, (r_oi - gap_out - r_in) * 0.5)
+    return r_in, r_out, r_io, r_oi
+
+
+def _cu_coil_radius_mm():
+    """Midline of copper shell — coil winds just outside inner pipe OD."""
+    r_in, r_out, _, _ = _cu_pipe_radii_mm()
+    return 0.5 * (r_in + r_out)
+
+
+def _tangent_around_axis(axis, x, y, z, sign):
+    """Unit tangent for circulation around pipe axis (coil current direction)."""
+    sg = 1.0 if sign >= 0 else -1.0
+    if axis == "z":
+        r = math.hypot(x, y)
+        if r < 1e-6:
+            return (0.0, 0.0, 0.0)
+        return (sg * -y / r, sg * x / r, 0.0)
+    if axis == "y":
+        r = math.hypot(x, z)
+        if r < 1e-6:
+            return (0.0, 0.0, 0.0)
+        return (sg * -z / r, 0.0, sg * x / r)
+    r = math.hypot(y, z)
+    if r < 1e-6:
+        return (0.0, 0.0, 0.0)
+    return (0.0, sg * -z / r, sg * y / r)
+
+
+def _cu_coil_sample_points(axis, face_coord, length_mm, r_coil):
+    """Sample points on one coil ring radius (outside Hs inner pipe OD)."""
+    inward = -math.copysign(1.0, face_coord)
+    face_outer = face_coord
+    n_along = max(1, int(length_mm / CU_SITE_SPACING_MM))
+    n_around = max(8, int(2.0 * math.pi * r_coil / CU_SITE_SPACING_MM))
+    pts = []
+    for ia in range(n_along):
+        t = (ia + 0.5) / n_along
+        axial = face_outer + inward * (length_mm * t)
+        for ik in range(n_around):
+            theta = 2.0 * math.pi * ik / n_around
+            c, s = math.cos(theta), math.sin(theta)
+            if axis == "z":
+                pts.append((r_coil * c, r_coil * s, axial))
+            elif axis == "y":
+                pts.append((r_coil * c, axial, r_coil * s))
+            else:
+                pts.append((axial, r_coil * c, r_coil * s))
+    return pts
+
+
+def _build_cu_face_field(axis, face_coord, face_amplitude, hs_length_mm,
+                         extension_mm, outer_edge_mm, outer_height_mm, ou_round_mm):
+    """FEA sites on coil path outside Hs inner pipe OD (not inside outer-pipe bore)."""
+    if abs(face_amplitude) < 1e-6:
+        return []
+    r_in, r_out, r_io, r_oi = _cu_pipe_radii_mm()
+    r_coil = _cu_coil_radius_mm()
+    if r_coil < r_io + 1e-6:
+        return []
+
+    length = hs_length_mm + extension_mm
+    hx = outer_edge_mm / 2.0
+    hy = outer_height_mm / 2.0
+    hz = outer_edge_mm / 2.0
+
+    sites = []
+    for (x, y, z) in _cu_coil_sample_points(axis, face_coord, length, r_coil):
+        if not _inside_rounded_box(x, y, z, hx, hy, hz, ou_round_mm):
+            continue
+        # Must be outside inner Hs pipe OD and not in outer Hs pipe metal zone
+        if axis == "z":
+            r = math.hypot(x, y)
+        elif axis == "y":
+            r = math.hypot(x, z)
+        else:
+            r = math.hypot(y, z)
+        if r < r_io + CU_CLEARANCE_FROM_HS_INNER_MM * 0.5:
+            continue
+        if r > r_oi - CU_CLEARANCE_FROM_HS_OUTER_MM * 0.5:
+            continue
+        tx, ty, tz = _tangent_around_axis(axis, x, y, z, face_amplitude)
+        if tx == ty == tz == 0.0:
+            continue
+        sites.append((x, y, z, tx, ty, tz, float(face_amplitude)))
+    return sites
+
+
+def _build_hs_face_voxels(axis, face_coord, length_mm, r_inner_od, r_outer_od,
+                          wall_mm, washer_t_mm, outer_edge_mm, outer_height_mm,
+                          ou_round_mm):
+    """Coaxial pipes + back washer on one face, opening inward from face_coord."""
+    r_io = r_inner_od / 2.0
+    r_ii = r_io - wall_mm
+    r_oo = r_outer_od / 2.0
+    r_oi = r_oo - wall_mm          # outer pipe wall (not flush to inner OD)
+    if r_ii <= 0 or r_oi <= r_io or r_oi >= r_oo:
+        return []
+
+    inner_pipe = _annulus_cylinder_voxels_x(length_mm, r_io, r_ii)
+    outer_pipe = _annulus_cylinder_voxels_x(length_mm, r_oo, r_oi)
+    # Washer in plane ⊥ axis at back; spans inner bore to outer pipe OD.
+    washer_w = _annulus_disk_voxels(axis, r_oo, r_ii, washer_t_mm)
+
+    inner_w = _voxels_to_axis(inner_pipe, axis)
+    outer_w = _voxels_to_axis(outer_pipe, axis)
+
+    half_l = length_mm / 2.0
+    half_wt = washer_t_mm / 2.0
+    inward = -math.copysign(1.0, face_coord)   # toward cube centre from outer face
+    pipe_ctr = face_coord + inward * half_l
+    washer_ctr = face_coord + inward * (length_mm + half_wt)
+    out = []
+    if axis == "x":
+        for part in (inner_w, outer_w):
+            out.extend(_translate(part, pipe_ctr, 0.0, 0.0))
+        out.extend(_translate(washer_w, washer_ctr, 0.0, 0.0))
+    elif axis == "y":
+        for part in (inner_w, outer_w):
+            out.extend(_translate(part, 0.0, pipe_ctr, 0.0))
+        out.extend(_translate(washer_w, 0.0, washer_ctr, 0.0))
+    else:  # z
+        for part in (inner_w, outer_w):
+            out.extend(_translate(part, 0.0, 0.0, pipe_ctr))
+        out.extend(_translate(washer_w, 0.0, 0.0, washer_ctr))
+
+    kept = []
+    for (x, y, z) in out:
+        if _inside_rounded_box(
+            x, y, z,
+            outer_edge_mm / 2.0, outer_height_mm / 2.0, outer_edge_mm / 2.0,
+            ou_round_mm,
+        ):
+            kept.append((x, y, z))
+    return kept
 
 
 def _inside_rounded_box(x, y, z, hx, hy, hz, r):
@@ -206,10 +508,10 @@ def invalidate_cache():
     _scene_cache = None
 
 
-def build_voxel_scene(force=False):
+def build_voxel_scene(force=False, cu_amplitudes=None, cu_scale=1.0):
     """Build (or return cached) the complete voxel scene dict."""
     global _scene_cache
-    if _scene_cache is not None and not force:
+    if _scene_cache is not None and not force and cu_amplitudes is None:
         return _scene_cache
 
     n   = FRAME_SIDES
@@ -253,6 +555,8 @@ def build_voxel_scene(force=False):
         f"collar_r={collar_r:.2f}mm"
     )
 
+    sc = MM_TO_SCENE
+
     cyl_raw:    list = []
     cap_raw:    list = []
     cyl_objects: list = []
@@ -271,8 +575,19 @@ def build_voxel_scene(force=False):
         for z_sign in (+1, -1):
             start = len(cyl_raw)
             cyl_raw.extend(_translate(rotated, mx, my, z_sign * half_h))
-            cyl_objects.append({"id": f"cy{cyl_idx}", "label": f"Cy {cyl_idx}",
-                                 "start": start, "count": len(cyl_raw) - start})
+            cz = z_sign * half_h
+            entry = {"id": f"cy{cyl_idx}", "label": f"Cy {cyl_idx}",
+                     "start": start, "count": len(cyl_raw) - start}
+            if n == 4:
+                c1 = _cube_corner(k, z_sign)
+                c2 = _cube_corner((k + 1) % 4, z_sign)
+                entry["corners"] = [c1, c2]
+                entry["ends"] = [
+                    _scene_point(vx0, vy0, cz, sc),
+                    _scene_point(vx1, vy1, cz, sc),
+                ]
+                entry["label"] = _cube_ring_edge_label(k, z_sign)
+            cyl_objects.append(entry)
             cyl_idx += 1
 
     # ── Strut cylinders: 1 per vertex ─────────────────────────────────────────
@@ -280,8 +595,18 @@ def build_voxel_scene(force=False):
         vx, vy = vertices[k]
         start = len(cyl_raw)
         cyl_raw.extend(_translate(vert_z, vx, vy, 0.0))
-        cyl_objects.append({"id": f"cy{cyl_idx}", "label": f"Cy {cyl_idx}",
-                             "start": start, "count": len(cyl_raw) - start})
+        entry = {"id": f"cy{cyl_idx}", "label": f"Cy {cyl_idx}",
+                 "start": start, "count": len(cyl_raw) - start}
+        if n == 4:
+            c1 = _cube_corner(k, +1)
+            c2 = _cube_corner(k, -1)
+            entry["corners"] = [c1, c2]
+            entry["ends"] = [
+                _scene_point(vx, vy, half_h, sc),
+                _scene_point(vx, vy, -half_h, sc),
+            ]
+            entry["label"] = _cube_strut_edge_label(k)
+        cyl_objects.append(entry)
         cyl_idx += 1
 
     # ── Caps + collars ─────────────────────────────────────────────────────────
@@ -320,13 +645,23 @@ def build_voxel_scene(force=False):
                 ccz = cz - z_sign * collar_off
                 cap_raw.extend(_translate(collar_strut_z, vx, vy, ccz))
 
-            cap_objects.append({"id": f"ca{cap_idx}", "label": f"Ca {cap_idx}",
-                                 "start": start, "count": len(cap_raw) - start})
+            cnum = _cube_corner(k, z_sign) if n == 4 else cap_idx
+            cap_objects.append({
+                "id": f"ca{cap_idx}",
+                "label": f"C{cnum}" if n == 4 else f"Ca {cap_idx}",
+                "corner": cnum if n == 4 else None,
+                "start": start,
+                "count": len(cap_raw) - start,
+            })
             cap_idx += 1
 
     # ── Plates (n=4 / cube only) ───────────────────────────────────────────────
     plate_raw:     list = []
     plate_objects: list = []
+
+    corner_pos_mm: dict = {}
+    if n == 4:
+        corner_pos_mm = _cube_corner_positions_mm(vertices, half_h)
 
     if n == 4:
         t  = PLATE_THICKNESS_MM
@@ -374,14 +709,103 @@ def build_voxel_scene(force=False):
                         plate_raw.append((x, y, z))
                 count = len(plate_raw) - start
                 if count > 0:
-                    label = f"F{fi}{qname}"
-                    plate_objects.append({"id": label, "label": label,
-                                          "start": start, "count": count})
+                    face_str = _CUBE_FACE_CLOCKWISE[fi]
+                    face_ids = [int(c) for c in face_str]
+                    uc = (u_lo + u_hi) / 2.0
+                    vc = (v_lo + v_hi) / 2.0
+                    wc = t / 2.0
+                    xc, yc, zc = xfm(uc, vc, wc)
+                    anchor = _closest_corner(face_ids, corner_pos_mm, xc, yc, zc)
+                    plate_objects.append({
+                        "id": f"pl{fi}{qname}",
+                        "label": f"F{face_str}",
+                        "face": face_str,
+                        "anchor_corner": anchor,
+                        "start": start,
+                        "count": count,
+                    })
 
-    total = len(cyl_raw) + len(cap_raw) + len(plate_raw)
+        # Hs: coaxial pipes + back washer at each face hole (axis ⊥ face)
+        hs_raw:     list = []
+        hs_objects: list = []
+        wt = HS_WALL_THICKNESS_MM
+        hs_faces = [
+            ("z",  hz),
+            ("z", -hz),
+            ("x",  h),
+            ("x", -h),
+            ("y",  h),
+            ("y", -h),
+        ]
+        for fi, (axis, face_c) in enumerate(hs_faces):
+            label = _cube_face_label(fi)
+            start = len(hs_raw)
+            hs_raw.extend(_build_hs_face_voxels(
+                axis, face_c,
+                HS_LENGTH_MM,
+                HS_INNER_PIPE_OD_MM, HS_OUTER_PIPE_OD_MM,
+                wt, HS_WASHER_THICKNESS_MM,
+                E, H, ou_r,
+            ))
+            count = len(hs_raw) - start
+            if count > 0:
+                hs_objects.append({
+                    "id": f"hs{fi}",
+                    "label": label,
+                    "face": _CUBE_FACE_CLOCKWISE[fi],
+                    "start": start,
+                    "count": count,
+                })
+
+        # Cu: FEA current sites in fixed pipe (not metal voxels; arrows drawn in JS)
+        cu_pos:     list = []
+        cu_dir:     list = []
+        cu_amp:     list = []
+        cu_objects: list = []
+        base_amps = list(cu_amplitudes if cu_amplitudes is not None else CU_FACE_AMPLITUDE)
+        face_amps = [float(a) * float(cu_scale) for a in base_amps]
+        cu_faces = [
+            ("z",  hz),
+            ("z", -hz),
+            ("x",  h),
+            ("x", -h),
+            ("y",  h),
+            ("y", -h),
+        ]
+        for fi, (axis, face_c) in enumerate(cu_faces):
+            amp = face_amps[fi] if fi < len(face_amps) else 1.0
+            flbl = _cube_face_label(fi)
+            start = len(cu_pos)
+            for (x, y, z, tx, ty, tz, a) in _build_cu_face_field(
+                axis, face_c, amp,
+                HS_LENGTH_MM, CU_PIPE_EXTENSION_MM,
+                E, H, ou_r,
+            ):
+                cu_pos.append((x, y, z))
+                cu_dir.append((tx, ty, tz))
+                cu_amp.append(a)
+            count = len(cu_pos) - start
+            if count > 0:
+                cu_objects.append({
+                    "id": f"cu{fi}", "label": f"{flbl} I={amp:+.2f}",
+                    "start": start, "count": count,
+                    "amplitude": round(amp, 4),
+                })
+
+    else:
+        hs_raw = []
+        hs_objects = []
+        cu_pos = []
+        cu_dir = []
+        cu_amp = []
+        cu_objects = []
+        face_amps = []
+
+    total = len(cyl_raw) + len(cap_raw) + len(plate_raw) + len(hs_raw)
     print(
         f"[fea] total voxels: {total:,}  "
-        f"({len(cyl_raw):,} cyl + {len(cap_raw):,} cap + {len(plate_raw):,} plates)"
+        f"({len(cyl_raw):,} cyl + {len(cap_raw):,} cap + {len(plate_raw):,} pl "
+        f"+ {len(hs_raw):,} hs)  |  Cu sites: {len(cu_pos):,}"
     )
 
     # ── Convert mm -> scene units ─────────────────────────────────────────────
@@ -402,6 +826,17 @@ def build_voxel_scene(force=False):
             "hole_diameter_mm": HOLE_DIAMETER_MM,
             "ho_color":         list(HO_COLOR),
             "mm_to_scene":      sc,
+            "cu_face_amplitudes": face_amps,
+            **(
+                {
+                    "cube_corners": {
+                        str(c): _scene_point(x, y, z, sc)
+                        for c, (x, y, z) in corner_pos_mm.items()
+                    },
+                }
+                if corner_pos_mm
+                else {}
+            ),
         },
         "cylinders": {
             "color":     list(CYLINDER_COLOR),
@@ -420,15 +855,37 @@ def build_voxel_scene(force=False):
             "objects":   plate_objects,
             "positions": to_scene(plate_raw),
         }
+    if hs_raw:
+        scene["hs"] = {
+            "color":     list(HS_COLOR),
+            "objects":   hs_objects,
+            "positions": to_scene(hs_raw),
+        }
+    if cu_pos:
+        scene["cu"] = {
+            "face_amplitudes":  face_amps,
+            "objects":          cu_objects,
+            "color_positive":   list(CU_COLOR_POSITIVE),
+            "color_negative":   list(CU_COLOR_NEGATIVE),
+            "sites": {
+                "positions":   to_scene(cu_pos),
+                "directions":  [[round(a, 4), round(b, 4), round(c, 4)]
+                                 for (a, b, c) in cu_dir],
+                "amplitudes":  [round(a, 4) for a in cu_amp],
+            },
+        }
 
     scene_json = json.dumps(scene, separators=(',', ':'))
     n_cyl = len(cyl_raw)
     n_cap = len(cap_raw)
     n_pl  = len(plate_raw)
+    n_hs  = len(hs_raw)
+    n_cu  = len(cu_pos)
     print(
         f"[fea] scene JSON ready: {len(scene_json):,} bytes  "
-        f"({n_cyl:,} cyl + {n_cap:,} cap + {n_pl:,} plate voxels)"
+        f"({n_cyl:,} cyl + {n_cap:,} cap + {n_pl:,} pl + {n_hs:,} hs + {n_cu:,} cu sites)"
     )
 
-    _scene_cache = scene
+    if cu_amplitudes is None and cu_scale == 1.0:
+        _scene_cache = scene
     return scene

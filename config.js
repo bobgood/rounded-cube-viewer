@@ -7,7 +7,7 @@ export const CONFIG = {
   // ── Geometry ───────────────────────────────────────────────────────────────
   CUBE_SIZE:     1.6,   // side length of each cube module
   CUBE_RADIUS:   0.22,  // corner rounding radius
-  CUBE_SEGMENTS: 6,     // subdivision segments for rounding
+  CUBE_SEGMENTS:6,     // subdivision segments for rounding
 
   // ── Magnetic physics ───────────────────────────────────────────────────────
   /** Pairs further apart than this are skipped entirely (1/r⁴ → negligible). */

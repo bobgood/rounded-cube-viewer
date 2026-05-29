@@ -65,5 +65,26 @@ SPIN_WHEEL_OFFSET_MM = 1.0   # pinwheel offset (mm); 0 = perfectly square plates
 PLATE_EDGE_INSET_MM  = 0.0   # additional inset from face edge (0 = full face)
 PLATE_COLOR          = METAL_COLOR
 
+# ── Hs: coaxial hole pipes + back washer (one assembly per holed face) ───────
+# Each pipe has wall thickness WT; outer pipe ID = HS_OUTER_OD - 2*WT (gap to inner).
+HS_INNER_PIPE_OD_MM  =  10.0   # outer diameter of inner pipe (mm)
+HS_OUTER_PIPE_OD_MM  = 15.0   # outer diameter of outer pipe (mm)
+HS_WALL_THICKNESS_MM =  1.0   # radial wall thickness per pipe (mm)
+HS_LENGTH_MM         =  6.0   # pipe length inward from outer face (mm)
+HS_WASHER_THICKNESS_MM = 1.0  # back washer depth along face normal (mm)
+HS_COLOR             = METAL_COLOR
+
+# ── Cu: FEA current field in fixed copper pipe (not Hs metal; arrows in JS) ─
+# Coil sits outside Hs inner pipe OD, in the gap before Hs outer pipe ID (not in outer bore).
+CU_CLEARANCE_FROM_HS_INNER_MM = 0.5   # gap outside Hs inner pipe OD (mm)
+CU_CLEARANCE_FROM_HS_OUTER_MM = 0.5   # gap inside Hs outer pipe ID (mm)
+CU_PIPE_WALL_THICKNESS_MM     = 1.0   # copper shell thickness (mm)
+CU_PIPE_EXTENSION_MM          = 0.5   # extra length inward beyond Hs inner pipe (mm)
+CU_SITE_SPACING_MM            = 1.0   # FEA sample spacing inside copper volume (mm)
+CU_COLOR_POSITIVE             = (1.00, 0.72, 0.12)   # JS arrow: +current (bright on dark bg)
+CU_COLOR_NEGATIVE             = (0.35, 0.88, 1.00)   # JS arrow: −current
+# Signed face amplitude (+Z,-Z,+X,-X,+Y,-Y): scales |I| and circulation sign.
+CU_FACE_AMPLITUDE             = (1.0, -1.0, 0.85, -0.85, 1.0, -1.0)
+
 # ── Scene scale ─────────────────────────────────────────────────────────────
 MM_TO_SCENE = 0.1   # 1 mm -> 0.1 Three.js scene units  (32 mm frame = 3.2 units)

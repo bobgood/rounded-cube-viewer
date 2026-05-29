@@ -22,7 +22,7 @@ import math
 import websockets
 from websockets import serve
 
-from fea_model import build_voxel_scene
+from fea_model import build_voxel_scene, invalidate_cache
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 clients:      set  = set()
@@ -31,6 +31,15 @@ current_view: str  = "cylinder"
 
 # Pre-build and serialise the FEA scene at startup (takes a few seconds)
 _voxel_scene_json: str = json.dumps(build_voxel_scene(), separators=(',', ':'))
+
+
+def _refresh_voxel_scene(cu_amplitudes=None, cu_scale=1.0):
+    global _voxel_scene_json
+    invalidate_cache()
+    _voxel_scene_json = json.dumps(
+        build_voxel_scene(force=True, cu_amplitudes=cu_amplitudes, cu_scale=cu_scale),
+        separators=(',', ':'),
+    )
 
 
 # ── Spinning-cubes demo ───────────────────────────────────────────────────────
@@ -72,6 +81,23 @@ async def handler(ws):
 
                 if t == "ui_state":
                     ui_state.update(msg)
+                    cu_changed = (
+                        "cu_scale" in msg
+                        or "cu_amplitudes" in msg
+                        or "cu_reverse" in msg
+                    )
+                    if cu_changed:
+                        amps = msg.get("cu_amplitudes")
+                        scale = float(msg.get("cu_scale", 1.0))
+                        if msg.get("cu_reverse"):
+                            if amps is None:
+                                from fea_config import CU_FACE_AMPLITUDE
+                                amps = [-a for a in CU_FACE_AMPLITUDE]
+                            else:
+                                amps = [-a for a in amps]
+                        _refresh_voxel_scene(cu_amplitudes=amps, cu_scale=scale)
+                        if current_view == "cylinder":
+                            await ws.send(_voxel_scene_json)
                     print(f"[ui]  spin={msg.get('spin')}  "
                           f"damp={msg.get('damping')}  "
                           f"strength={msg.get('strength')}")
