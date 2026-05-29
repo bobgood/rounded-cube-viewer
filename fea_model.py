@@ -2,11 +2,12 @@
 
 Generates a regular n-gon prism frame:
   - 3n cylinder rods
-  - 2n corner caps  — full sphere + 3 unclipped collar stubs per corner
+  - 2n corner caps  — sphere + 3 collar stubs (CAP_LENGTH_MM from centre)
   - 6 plate faces   — 4 spin-wheel quadrant panels per face (n=4 only)
 
-All frame elements are inset from the bounding box by FRAME_INSET_MM so that
-the cap spheres protrude slightly past each face for a ball-joint look.
+FRAME_EDGE_MM  is the outer envelope. Cylinder rods sit on
+an inset skeleton (see _skeleton_dims). Caps, plates, and Ou may still use
+mixed semantics until aligned.
 
 Scene message format
 --------------------
@@ -32,11 +33,11 @@ from fea_config import (
     CYLINDER_RADIUS_MM,
     CYLINDER_COLOR,
     CAP_DIAMETER_MM,
+    CAP_LENGTH_MM,
     CAP_COLOR,
     COLLAR_DIAMETER_MM,
     FRAME_SIDES,
     FRAME_EDGE_MM,
-    FRAME_HEIGHT_MM,
     FRAME_GAP_MM,
     FRAME_INSET_MM,
     PLATE_THICKNESS_MM,
@@ -44,7 +45,6 @@ from fea_config import (
     SPIN_WHEEL_OFFSET_MM,
     PLATE_EDGE_INSET_MM,
     PLATE_COLOR,
-    OU_ROUNDING_MM,
     OU_COLOR,
     HOLE_DIAMETER_MM,
     HO_COLOR,
@@ -119,6 +119,83 @@ def _translate(voxels, dx, dy, dz):
     return [(x + dx, y + dy, z + dz) for (x, y, z) in voxels]
 
 
+def _inside_rounded_box(x, y, z, hx, hy, hz, r):
+    """Axis-aligned rounded box centred at origin (matches Ou RoundedBoxGeometry)."""
+    if r <= 0:
+        return abs(x) <= hx and abs(y) <= hy and abs(z) <= hz
+    ax = abs(x) - (hx - r)
+    ay = abs(y) - (hy - r)
+    az = abs(z) - (hz - r)
+    if ax <= 0 and ay <= 0 and az <= 0:
+        return True
+    ax = max(ax, 0.0)
+    ay = max(ay, 0.0)
+    az = max(az, 0.0)
+    return ax * ax + ay * ay + az * az <= r * r
+
+
+def _inside_ho_union(x, y, z, ho_r, half_x, half_y, half_z):
+    """True if inside any of the three orthogonal Ho subtraction cylinders."""
+    r2 = ho_r * ho_r
+    if y * y + z * z <= r2 and abs(x) <= half_x:
+        return True
+    if x * x + z * z <= r2 and abs(y) <= half_y:
+        return True
+    if x * x + y * y <= r2 and abs(z) <= half_z:
+        return True
+    return False
+
+
+def _keep_plate_voxel(x, y, z, outer_edge_mm, outer_height_mm, ou_round_mm, hole_diameter_mm):
+    """Plates only: inside Ou envelope and outside Ho holes."""
+    hx = outer_edge_mm / 2.0
+    hy = outer_height_mm / 2.0
+    hz = outer_edge_mm / 2.0
+    ho_r = hole_diameter_mm / 2.0
+    if not _inside_rounded_box(x, y, z, hx, hy, hz, ou_round_mm):
+        return False
+    return not _inside_ho_union(x, y, z, ho_r, hx, hy, hz)
+
+
+# ── Skeleton vs outer envelope ─────────────────────────────────────────────────
+
+def _skeleton_dims(outer_edge_mm, outer_height_mm, inset_mm, sides, gap_mm):
+    """Derive n-gon skeleton layout for cylinder rods from outer envelope + inset.
+
+    outer_* : face-to-face outer box (mm).
+    inset_mm : per-face inset toward centre; skeleton polygon edge = outer_edge - 2*inset.
+    Returns vertices, half_height, ring_len, vert_len, gap_ring, gap_strut.
+    """
+    n = sides
+    skel_e = outer_edge_mm - 2.0 * inset_mm
+    skel_h = outer_height_mm - 2.0 * inset_mm
+    half_h = skel_h / 2.0
+
+    r = skel_e / (2.0 * math.sin(math.pi / n))
+    ao = math.pi / n
+    vertices = [
+        (r * math.cos(2 * math.pi * k / n + ao),
+         r * math.sin(2 * math.pi * k / n + ao))
+        for k in range(n)
+    ]
+
+    ring_len = max(VOXEL_SIZE_MM, min(CYLINDER_LENGTH_MM, skel_e - 2 * gap_mm))
+    vert_len = max(VOXEL_SIZE_MM, min(CYLINDER_LENGTH_MM, skel_h - 2 * gap_mm))
+    gap_ring = (skel_e - ring_len) / 2.0
+    gap_strut = (skel_h - vert_len) / 2.0
+
+    return {
+        "vertices": vertices,
+        "half_h": half_h,
+        "ring_len": ring_len,
+        "vert_len": vert_len,
+        "gap_ring": gap_ring,
+        "gap_strut": gap_strut,
+        "skel_e": skel_e,
+        "skel_h": skel_h,
+    }
+
+
 # ── Scene builder ─────────────────────────────────────────────────────────────
 
 _scene_cache = None
@@ -136,28 +213,18 @@ def build_voxel_scene(force=False):
         return _scene_cache
 
     n   = FRAME_SIDES
-    E   = FRAME_EDGE_MM       # bounding-box edge (plates / Ou use this)
-    H   = FRAME_HEIGHT_MM     # bounding-box height
+    E   = FRAME_EDGE_MM       # outer envelope (plates / Ou / frame_config)
+    H   = FRAME_EDGE_MM
     gap = FRAME_GAP_MM
+    ins = FRAME_INSET_MM
 
-    # ── Inset: frame elements moved inward from the bounding-box faces ────────
-    ins    = FRAME_INSET_MM
-    E_e    = E - 2 * ins        # effective edge for element placement
-    H_e    = H - 2 * ins        # effective height for element placement
-    half_h = H_e / 2.0
-
-    R  = E_e / (2.0 * math.sin(math.pi / n))
-    ao = math.pi / n
-    vertices = [
-        (R * math.cos(2 * math.pi * k / n + ao),
-         R * math.sin(2 * math.pi * k / n + ao))
-        for k in range(n)
-    ]
-
-    ring_len  = max(VOXEL_SIZE_MM, min(CYLINDER_LENGTH_MM, E_e - 2 * gap))
-    vert_len  = max(VOXEL_SIZE_MM, min(CYLINDER_LENGTH_MM, H_e - 2 * gap))
-    gap_ring  = (E_e - ring_len) / 2.0
-    gap_strut = (H_e - vert_len) / 2.0
+    sk = _skeleton_dims(E, H, ins, n, gap)
+    vertices   = sk["vertices"]
+    half_h     = sk["half_h"]
+    ring_len   = sk["ring_len"]
+    vert_len   = sk["vert_len"]
+    gap_ring   = sk["gap_ring"]
+    gap_strut  = sk["gap_strut"]
 
     # Templates (along X axis; strut is re-mapped to Z axis below)
     ring_tpl       = _cylinder_voxels_x(ring_len)
@@ -165,9 +232,14 @@ def build_voxel_scene(force=False):
     cap_r          = CAP_DIAMETER_MM / 2.0
     cap_sphere_tpl = _sphere_voxels(cap_r)
     collar_r       = COLLAR_DIAMETER_MM / 2.0
-    collar_ext     = VOXEL_SIZE_MM      # extra extension past sphere centre
-    collar_ring_tpl  = _cylinder_voxels_x(gap_ring  + collar_ext, collar_r) if gap_ring  > 0 else []
-    collar_strut_tpl = _cylinder_voxels_x(gap_strut + collar_ext, collar_r) if gap_strut > 0 else []
+    collar_len     = CAP_LENGTH_MM
+    collar_off     = collar_len / 2.0   # stub centred on sphere: inner end at corner
+    collar_ring_tpl  = (
+        _cylinder_voxels_x(collar_len, collar_r) if collar_len > 0 else []
+    )
+    collar_strut_tpl = (
+        _cylinder_voxels_x(collar_len, collar_r) if collar_len > 0 else []
+    )
 
     # Map strut templates from X-axis to Z-axis: (x,y,z) -> (y,z,x)
     vert_z          = [(y, z, x) for (x, y, z) in vert_tpl]
@@ -175,8 +247,10 @@ def build_voxel_scene(force=False):
 
     print(
         f"[fea] {n}-gon: {n*3} cyl + {n*2} caps  |  "
+        f"outer={E:.1f}mm  skeleton_edge={sk['skel_e']:.1f}mm  "
         f"ring={ring_len:.1f}mm  strut={vert_len:.1f}mm  "
-        f"cap_r={cap_r:.1f}mm  collar_r={collar_r:.2f}mm"
+        f"cap_d={CAP_DIAMETER_MM:.1f}mm  cap_len={collar_len:.1f}mm  "
+        f"collar_r={collar_r:.2f}mm"
     )
 
     cyl_raw:    list = []
@@ -185,6 +259,7 @@ def build_voxel_scene(force=False):
     cap_objects:  list = []
     cyl_idx = 0
 
+    # ── Cylinders (skeleton placement from outer E/H + FRAME_INSET_MM) ───────
     # ── Ring cylinders: 2 per edge (top + bottom), n edges ───────────────────
     for k in range(n):
         vx0, vy0 = vertices[k]
@@ -222,29 +297,27 @@ def build_voxel_scene(force=False):
             # Full sphere (unclipped) centred at the corner
             cap_raw.extend(_translate(cap_sphere_tpl, vx, vy, cz))
 
-            # Ring collar toward previous vertex
+            # Ring collar toward previous vertex (from sphere centre)
             if collar_ring_tpl:
                 a = math.atan2(vy_prev - vy, vx_prev - vx)
-                half_len = (gap_ring + collar_ext) / 2.0
                 cap_raw.extend(
                     _translate(_rotate_z(collar_ring_tpl, a),
-                                vx + math.cos(a) * half_len,
-                                vy + math.sin(a) * half_len,
+                                vx + math.cos(a) * collar_off,
+                                vy + math.sin(a) * collar_off,
                                 cz))
 
             # Ring collar toward next vertex
             if collar_ring_tpl:
                 a = math.atan2(vy_next - vy, vx_next - vx)
-                half_len = (gap_ring + collar_ext) / 2.0
                 cap_raw.extend(
                     _translate(_rotate_z(collar_ring_tpl, a),
-                                vx + math.cos(a) * half_len,
-                                vy + math.sin(a) * half_len,
+                                vx + math.cos(a) * collar_off,
+                                vy + math.sin(a) * collar_off,
                                 cz))
 
-            # Strut collar (Z direction, toward cylinder end)
+            # Strut collar toward vertical rod (from sphere centre)
             if collar_strut_z:
-                ccz = cz - z_sign * (gap_strut + collar_ext) / 2.0
+                ccz = cz - z_sign * collar_off
                 cap_raw.extend(_translate(collar_strut_z, vx, vy, ccz))
 
             cap_objects.append({"id": f"ca{cap_idx}", "label": f"Ca {cap_idx}",
@@ -260,9 +333,11 @@ def build_voxel_scene(force=False):
         g  = PLATE_GAP_MM / 2.0
         d  = SPIN_WHEEL_OFFSET_MM
         pe = PLATE_EDGE_INSET_MM
-        # Plates sit on the ORIGINAL bounding-box faces (E x H), not the inset frame.
+        # Plates on outer faces; clipped to Ou rounded box, Ho subtracted (Cy/Ca unchanged).
         h  = E / 2.0 - pe
         hz = H / 2.0 - pe
+        ou_r = ins
+        ho_d = HOLE_DIAMETER_MM
 
         def xfm0(u, v, w): return (u,     v,      hz - w)   # +Z top
         def xfm1(u, v, w): return (u,     v,     -hz + w)   # -Z bottom
@@ -294,7 +369,9 @@ def build_voxel_scene(force=False):
                     continue
                 start = len(plate_raw)
                 for (u, v, w) in _box_voxels(u_lo, u_hi, v_lo, v_hi, t):
-                    plate_raw.append(xfm(u, v, w))
+                    x, y, z = xfm(u, v, w)
+                    if _keep_plate_voxel(x, y, z, E, H, ou_r, ho_d):
+                        plate_raw.append((x, y, z))
                 count = len(plate_raw) - start
                 if count > 0:
                     label = f"F{fi}{qname}"
@@ -320,7 +397,7 @@ def build_voxel_scene(force=False):
         "frame_config": {
             "edge_mm":          E,
             "height_mm":        H,
-            "ou_rounding_mm":   OU_ROUNDING_MM,
+            "ou_rounding_mm":   ins,
             "ou_color":         list(OU_COLOR),
             "hole_diameter_mm": HOLE_DIAMETER_MM,
             "ho_color":         list(HO_COLOR),

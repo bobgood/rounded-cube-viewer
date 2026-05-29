@@ -262,22 +262,30 @@ function buildOuHo(fc) {
   _ouGroup.userData.ouSolid = ouSolid;
   scene.add(_ouGroup);
 
-  // Ho: 3 crossing cylinders
-  _hoGroup = new THREE.Group();
-  const hoMat = new THREE.MeshStandardMaterial({
-    color: new THREE.Color(hr, hg, hb), transparent: true, opacity: 0.3,
+  // Ho: 3 crossing cylinders (subtraction tools) — same visual style as Ou
+  const hoColor = new THREE.Color(hr, hg, hb);
+  const hoSolidMat = new THREE.MeshStandardMaterial({
+    color: hoColor, transparent: true, opacity: 0.08,
+    side: THREE.BackSide,
   });
-  const mkHoCyl = (rx, ry, rz, len) => {
-    const m = new THREE.Mesh(
-      new THREE.CylinderGeometry(hd / 2, hd / 2, len, 32), hoMat
-    );
-    m.rotation.set(rx, ry, rz);
-    return m;
+  const hoWireMat = new THREE.LineBasicMaterial({
+    color: hoColor, transparent: true, opacity: 0.6,
+  });
+  _hoGroup = new THREE.Group();
+  const addHoCyl = (rx, ry, rz, len) => {
+    const geo = new THREE.CylinderGeometry(hd / 2, hd / 2, len, 32);
+    const solid = new THREE.Mesh(geo, hoSolidMat);
+    solid.rotation.set(rx, ry, rz);
+    _hoGroup.add(solid);
+    const wire = new THREE.LineSegments(new THREE.EdgesGeometry(geo), hoWireMat);
+    wire.rotation.set(rx, ry, rz);
+    _hoGroup.add(wire);
   };
-  _hoGroup.add(mkHoCyl(0,           0, Math.PI / 2, ew));  // X axis
-  _hoGroup.add(mkHoCyl(0,           0, 0,           eh));  // Y axis
-  _hoGroup.add(mkHoCyl(Math.PI / 2, 0, 0,           ew));  // Z axis
-  _hoGroup.userData.hoMat = hoMat;
+  addHoCyl(0,           0, Math.PI / 2, ew);  // X axis
+  addHoCyl(0,           0, 0,           eh);  // Y axis
+  addHoCyl(Math.PI / 2, 0, 0,           ew);  // Z axis
+  _hoGroup.userData.hoSolidMat = hoSolidMat;
+  _hoGroup.userData.hoWireMat  = hoWireMat;
   scene.add(_hoGroup);
 }
 
@@ -476,8 +484,10 @@ if (_opSlider) {
     plateMat.opacity  = op;
     if (_ouGroup?.userData.ouSolid)
       _ouGroup.userData.ouSolid.material.opacity = Math.max(0.02, op * 0.08);
-    if (_hoGroup?.userData.hoMat)
-      _hoGroup.userData.hoMat.opacity = Math.max(0.05, op * 0.3);
+    if (_hoGroup?.userData.hoSolidMat)
+      _hoGroup.userData.hoSolidMat.opacity = Math.max(0.02, op * 0.08);
+    if (_hoGroup?.userData.hoWireMat)
+      _hoGroup.userData.hoWireMat.opacity = Math.max(0.02, op * 0.6);
   });
 }
 

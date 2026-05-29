@@ -19,34 +19,34 @@ CYLINDER_LENGTH_MM   = 20.0  # usable length of each rod (mm); centred on edge
 CYLINDER_DIAMETER_MM =  7.0  # outer diameter (mm)
 CYLINDER_RADIUS_MM   = CYLINDER_DIAMETER_MM / 2.0
 
-# ── Cap + collar geometry ────────────────────────────────────────────────────
-# Cap sphere and collar share the same radius = cylinder radius + CAP_EXTRA_MM.
-# All frame elements are inset from the bounding box by half that radius so the
-# sphere protrudes by exactly FRAME_INSET_MM past each outer face.
-CAP_EXTRA_MM       = 2.0     # extra radius beyond the cylinder (mm)
-_CAP_R             = CYLINDER_RADIUS_MM + CAP_EXTRA_MM   # = 5.5 mm
-CAP_DIAMETER_MM    = _CAP_R * 2          # = 11.0 mm  (sphere diameter)
-COLLAR_DIAMETER_MM = _CAP_R * 2          # = 11.0 mm  (collar diameter, same as sphere)
-FRAME_INSET_MM     = _CAP_R / 2          # = 2.75 mm  (elements moved inward from face)
-
 # ── Frame (n-gon prism of cylinders) ────────────────────────────────────────
 # 3n cylinders  +  2n corner caps (each with 3 collar stubs).
 #
 #   FRAME_SIDES = 4  ->  cube frame   (12 cylinders, 8 caps)
 #   FRAME_SIDES = 6  ->  hex prism    (18 cylinders, 12 caps)
 #   FRAME_SIDES = 8  ->  oct prism    (24 cylinders, 16 caps)
+#
+# FRAME_EDGE_MM = outer envelope (face-to-face, mm).
+# Ou, plates, and frame_config use these directly.
+# Cylinder rods are placed on a skeleton inset inward by FRAME_INSET_MM per face.
+# Plates are clipped to Ou and subtract Ho; caps still use skeleton placement.
 
 FRAME_SIDES      = 4      # number of polygon sides
-FRAME_EDGE_MM    = 32.0   # polygon edge length for top/bottom ring (mm)
-FRAME_HEIGHT_MM  = 32.0   # prism height / vertical strut length (mm)
+FRAME_EDGE_MM    = 32.0   # outer envelope width/depth (mm), face to face
+FRAME_INSET_MM   =  5.0   # recess / skeleton inset from outer face (mm)
 
-# Minimum gap at each end of a cylinder along its axis (mm).
-# Also determines collar length: collar_len = (edge_len - cyl_len) / 2 + ext.
+# Minimum gap at each end of a cylinder rod along its axis (mm).
 FRAME_GAP_MM     = 2.0
 
+# ── Cap + collar geometry (after FRAME_INSET_MM) ─────────────────────────────
+# Sphere and collar diameter = 2 × recess (no CAP_EXTRA; 7 mm rods sit inside).
+CAP_DIAMETER_MM    = 2.0 * FRAME_INSET_MM   # = 10.0 mm with inset 5
+COLLAR_DIAMETER_MM = CAP_DIAMETER_MM
+# Collar stubs: cylinders from sphere centre toward each rod (3 per corner).
+CAP_LENGTH_MM      =  4.0   # length of each stub along its axis (mm)
+
 # ── Ou: rounded bounding-box outline ────────────────────────────────────────
-# Displayed as a translucent solid + edge lines — purely visual, no voxels.
-OU_ROUNDING_MM   =  3.0               # corner rounding radius (mm)
+# Corner fillet = FRAME_INSET_MM (same as recess / cap radius). Colour only here.
 OU_COLOR         = (0.35, 0.65, 1.0)  # light blue
 
 # ── Ho: 3 orthogonal crossing cylinders (hole/subtractor) ───────────────────
