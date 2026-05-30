@@ -152,3 +152,58 @@ NG12_COIL_CURRENTS: dict = {
     # Vertical struts:  e15  e26  e37  e48
     "e15": 1.0, "e26": 1.0, "e37": 1.0, "e48": 1.0,
 }
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ SCENE: "30coils" — full frame (split edge coils + corner caps + face        ║
+# ║         horseshoes). Ported from the old voxel "frame"/"30 coils" scene.    ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+# Steel skeleton = 12 edge rods + 8 corner caps (sphere + 3 collar stubs) + a
+# nested-pipe "horseshoe" on each of the 6 faces (inner pipe + outer pipe joined
+# by a back washer). 30 coils = 24 split edge coils (two per edge, E{a}{b} near
+# corner a and E{b}{a} near corner b, with a gap at the edge midpoint) + 6 face
+# coils (one in each horseshoe annulus). Corners on the inset skeleton sit at
+# +/- NG_CUBE_HALF_MM; faces at +/- FRAME_EDGE_MM/2.
+
+# ── Edge rods (Cy): one steel cylinder centred on each edge midpoint ─────────
+NG30_ROD_RADIUS_MM = 3.5     # rod outer radius (= CYLINDER_DIAMETER/2)
+NG30_ROD_LENGTH_MM = 14.0    # rod length along the edge (centred; leaves ends bare)
+
+# ── Corner caps (Ca): sphere at each corner + 3 collar stubs toward its edges ─
+NG30_CAP_RADIUS_MM    = 5.0  # corner sphere radius (= CAP_DIAMETER/2 = inset)
+NG30_COLLAR_RADIUS_MM = 5.0  # collar stub radius (= COLLAR_DIAMETER/2)
+NG30_COLLAR_LENGTH_MM = 5.0  # collar stub length along its edge, inner end at corner
+
+# ── Edge coils (Cv): annular sleeve, two per edge ────────────────────────────
+NG30_CV_GAP_FROM_CORNER_MM    = 5.5   # bare rod length from the corner before the coil
+NG30_CV_EXTEND_MM             = 5.5   # coil length along the edge
+NG30_CV_THICKNESS_MM          = 1.2   # radial coil band thickness
+NG30_CV_CLEARANCE_FROM_ROD_MM = 0.25  # radial gap from rod OD to coil ID
+
+# ── Face horseshoe (Hs): two coaxial steel pipes + a back washer, per face ───
+# Both pipes share the face-normal axis and run inward HS_LENGTH from the outer
+# face; the washer bridges them behind (deeper inward).
+NG30_HS_INNER_PIPE_OD_MM   = 10.0   # inner pipe outer diameter
+NG30_HS_OUTER_PIPE_OD_MM   = 14.5   # outer pipe outer diameter
+NG30_HS_WALL_THICKNESS_MM  = 1.0    # radial wall thickness of each pipe
+NG30_HS_LENGTH_MM          = 6.0    # pipe length inward from the outer face
+NG30_HS_WASHER_THICKNESS_MM = 1.0   # back washer depth along the face normal
+
+# ── Face coils (Cu): annular sleeve in the gap between the two Hs pipes ───────
+NG30_CU_CLEARANCE_FROM_HS_INNER_MM = 0.5   # radial gap outside the inner pipe OD
+NG30_CU_CLEARANCE_FROM_HS_OUTER_MM = 0.5   # radial gap inside the outer pipe ID
+NG30_CU_WALL_THICKNESS_MM          = 1.0   # coil band radial thickness (capped to fit)
+NG30_CU_EXTENSION_MM               = 0.5   # extra coil length inward beyond the pipes
+
+# ── Coil current weights (corner-keyed for edges, face-keyed for faces) ──────
+# Edge coil near corner X takes its weight from key "c{X}" unless an explicit
+# directed-edge key (e.g. "e14") is present. Face coil takes its weight from the
+# clockwise face key (f1234 …). This reproduces the "common pole at each corner"
+# wiring: the 3 edge coils meeting at a corner share that corner's sign, so the
+# corner acts as one magnetic pole. Default: top corners +1, bottom −1, faces 0.
+NG30_COIL_CURRENTS: dict = {
+    "c1": 1.0, "c2": 1.0, "c3": 1.0, "c4": 1.0,
+    "c5": -1.0, "c6": -1.0, "c7": -1.0, "c8": -1.0,
+    "f1234": 0.0, "f5678": 0.0, "f1265": 0.0,
+    "f3487": 0.0, "f1485": 0.0, "f3276": 0.0,
+}

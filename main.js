@@ -240,7 +240,8 @@ scene.add(gmMesh);
 const MODE_OPTIONS = [
   { id: "cylinder:1dipole",      view: "cylinder",       scene: "1dipole",      label: "1 dipole" },
   { id: "cylinder:12dipoles_ng", view: "cylinder",       scene: "12dipoles_ng", label: "12 dipoles" },
-  { id: "cylinder:frame",        view: "cylinder",       scene: "frame",        label: "30 coils experiment" },
+  { id: "cylinder:30coils_ng",   view: "cylinder",       scene: "30coils_ng",   label: "30 coils" },
+  { id: "cylinder:frame",        view: "cylinder",       scene: "frame",        label: "30 coils (voxel)" },
   { id: "cylinder:dipole",       view: "cylinder",       scene: "dipole",       label: "Dipole (voxel)" },
   { id: "cylinder:12dipoles",    view: "cylinder",       scene: "12dipoles",    label: "12 dipoles (voxel)" },
   { id: "spinning_cubes",        view: "spinning_cubes", scene: null,           label: "Spinning cubes" },

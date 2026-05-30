@@ -154,6 +154,12 @@ async def handler(ws):
                                 solve_ng12_bfield, mu_r=mu_r, fea_strength_scale=scale,
                                 saturate=saturate,
                             )
+                        elif _active_scene == "30coils_ng":
+                            from ngsolve_solve import solve_ng30_bfield
+                            payload = await asyncio.to_thread(
+                                solve_ng30_bfield, mu_r=mu_r, fea_strength_scale=scale,
+                                saturate=saturate,
+                            )
                         else:
                             payload = await asyncio.to_thread(
                                 build_bfield_lines, fea_strength_scale=scale, mu_r=mu_r

@@ -264,3 +264,11 @@ def solve_ng12_bfield(*, mu_r: float = 1.0, fea_strength_scale: float = 1.0,
     from scene_ng12dipoles import build_geometry
     return _run_scene_solve(build_geometry, tag="12dipole", mu_r=mu_r,
                             fea_strength_scale=fea_strength_scale, saturate=saturate)
+
+
+def solve_ng30_bfield(*, mu_r: float = 1.0, fea_strength_scale: float = 1.0,
+                      saturate: bool = False) -> dict:
+    """Solve the full frame "30coils" scene (30 coils) → "bfield_lines" payload."""
+    from ng_frame import build_geometry
+    return _run_scene_solve(build_geometry, tag="30coils", mu_r=mu_r,
+                            fea_strength_scale=fea_strength_scale, saturate=saturate)
