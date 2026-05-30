@@ -238,11 +238,12 @@ scene.add(gmMesh);
 
 // ─── Unified modes (one dropdown: experiments + spinning cubes) ───────────────
 const MODE_OPTIONS = [
-  { id: "cylinder:ngmesh",    view: "cylinder",       scene: "ngmesh",    label: "NGSolve mesh (rod + coil)" },
-  { id: "cylinder:frame",     view: "cylinder",       scene: "frame",     label: "30 coils experiment" },
-  { id: "cylinder:dipole",    view: "cylinder",       scene: "dipole",    label: "Dipole (e12 rod + coil)" },
-  { id: "cylinder:12dipoles", view: "cylinder",       scene: "12dipoles", label: "12 dipoles (all edges)" },
-  { id: "spinning_cubes",     view: "spinning_cubes", scene: null,        label: "Spinning cubes" },
+  { id: "cylinder:1dipole",      view: "cylinder",       scene: "1dipole",      label: "1 dipole" },
+  { id: "cylinder:12dipoles_ng", view: "cylinder",       scene: "12dipoles_ng", label: "12 dipoles" },
+  { id: "cylinder:frame",        view: "cylinder",       scene: "frame",        label: "30 coils experiment" },
+  { id: "cylinder:dipole",       view: "cylinder",       scene: "dipole",       label: "Dipole (voxel)" },
+  { id: "cylinder:12dipoles",    view: "cylinder",       scene: "12dipoles",    label: "12 dipoles (voxel)" },
+  { id: "spinning_cubes",        view: "spinning_cubes", scene: null,           label: "Spinning cubes" },
 ];
 
 // ─── View state (opacity sliders; 0 = hidden) ─────────────────────────────────
@@ -264,8 +265,10 @@ let _coilWeights  = null;
 let _feaRunning   = false;
 let _cuFieldBase  = null;
 let _cvFieldBase  = null;
-let _cuArrowMesh  = null;
-let _cvArrowMesh  = null;
+let _cuArrowMesh       = null;
+let _cuArrowMeshBehind = null;
+let _cvArrowMesh       = null;
+let _cvArrowMeshBehind = null;
 let _cmArrowMesh  = null;
 let _cmFieldBase  = null;
 let _cvObjects    = [];
@@ -396,11 +399,15 @@ function _applyCurrentArrows(field, vs, maxCount, renderOrder, logTag, feaScale 
     toneMapped: false,
     transparent: true,
     opacity: _currentOpacity,
-    depthTest: false,
+    depthTest: true,
     depthWrite: false,
   });
   const mesh = new THREE.InstancedMesh(geo, mat, n);
   mesh.frustumCulled = false;
+  // Front pass: default LessEqualDepth. Must render AFTER the steel writes depth
+  // (steel renderOrder 1), so arrows behind the metal fail the test and only the
+  // in-front arrows draw — at full opacity regardless of how transparent the metal is.
+  mesh.material.depthFunc = THREE.LessEqualDepth;
   mesh.renderOrder = renderOrder;
 
   let count = 0;
@@ -430,18 +437,49 @@ function _applyCurrentArrows(field, vs, maxCount, renderOrder, logTag, feaScale 
   mesh.instanceMatrix.needsUpdate = true;
   if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
   scene.add(mesh);
+  // ── Behind pass: same geometry, GreaterDepth test, faded opacity ────────
+  // Renders only where the arrow is BEHIND geometry already in the depth
+  // buffer (steel/voxels) — giving a natural fade-through look.
+  // renderOrder must match the front pass so both run after the surface writes depth.
+  const matBehind = new THREE.MeshBasicMaterial({
+    toneMapped: false,
+    transparent: true,
+    opacity: _currentOpacity * 0.18,
+    depthTest: true,
+    depthWrite: false,
+    depthFunc: THREE.GreaterDepth,
+  });
+  const meshBehind = new THREE.InstancedMesh(geo, matBehind, count);
+  meshBehind.frustumCulled = false;
+  meshBehind.renderOrder = renderOrder;
+  for (let i = 0; i < count; i++) {
+    mesh.getMatrixAt(i, _dummy.matrix);
+    meshBehind.setMatrixAt(i, _dummy.matrix);
+    const col = new THREE.Color();
+    mesh.getColorAt(i, col);
+    meshBehind.setColorAt(i, col);
+  }
+  meshBehind.count = count;
+  meshBehind.instanceMatrix.needsUpdate = true;
+  if (meshBehind.instanceColor) meshBehind.instanceColor.needsUpdate = true;
+  scene.add(meshBehind);
+
   console.info(`[${logTag}] ${count} current arrows`);
-  return mesh;
+  return [mesh, meshBehind];
 }
 
 function clearCuArrows() {
   _disposeArrowMesh(_cuArrowMesh);
+  _disposeArrowMesh(_cuArrowMeshBehind);
   _cuArrowMesh = null;
+  _cuArrowMeshBehind = null;
 }
 
 function clearCvArrows() {
   _disposeArrowMesh(_cvArrowMesh);
+  _disposeArrowMesh(_cvArrowMeshBehind);
   _cvArrowMesh = null;
+  _cvArrowMeshBehind = null;
 }
 
 /** Instanced cones on fea_grid coil cells (Cu + Cv); direction from J (uniform debug color). */
@@ -551,7 +589,7 @@ function applyCuField(cu, vs, feaScale = 1.0) {
     console.warn("[Cu] no sites — restart python -u server.py");
     return;
   }
-  _cuArrowMesh = _applyCurrentArrows(cu, vs, CU_ARROW_MAX, 50, "Cu", feaScale);
+  [_cuArrowMesh, _cuArrowMeshBehind] = _applyCurrentArrows(cu, vs, CU_ARROW_MAX, 2, "Cu", feaScale);
   _cuObjects = cu.objects ?? [];
 }
 
@@ -562,7 +600,7 @@ function applyCvField(cv, vs, feaScale = 1.0) {
     console.warn("[Cv] no sites — restart python -u server.py");
     return;
   }
-  _cvArrowMesh = _applyCurrentArrows(cv, vs, CV_ARROW_MAX, 51, "Cv", feaScale);
+  [_cvArrowMesh, _cvArrowMeshBehind] = _applyCurrentArrows(cv, vs, CV_ARROW_MAX, 2, "Cv", feaScale);
   _cvObjects = cv.objects ?? [];
 }
 
@@ -624,16 +662,25 @@ function applyView() {
   capMesh.visible    = isCyl && parts && capMesh.count > 0;
   plateMesh.visible  = isCyl && parts && plateMesh.count > 0;
   hsMesh.visible     = isCyl && parts && hsMesh.count > 0;
+  if (_ngSteelGroup) _ngSteelGroup.visible = isCyl && parts;
   gmMesh.visible     = isCyl && _metalOpacity > 0.001 && gmMesh.count > 0;
   if (_cuArrowMesh) {
     const show = isCyl && _currentOpacity > 0.001;
     _cuArrowMesh.visible = show;
     if (_cuArrowMesh.material) _cuArrowMesh.material.opacity = _currentOpacity;
   }
+  if (_cuArrowMeshBehind) {
+    _cuArrowMeshBehind.visible = isCyl && _currentOpacity > 0.001 && _partsOpacity < 0.001;
+    if (_cuArrowMeshBehind.material) _cuArrowMeshBehind.material.opacity = _currentOpacity * 0.35;
+  }
   if (_cvArrowMesh) {
     const show = isCyl && _currentOpacity > 0.001;
     _cvArrowMesh.visible = show;
     if (_cvArrowMesh.material) _cvArrowMesh.material.opacity = _currentOpacity;
+  }
+  if (_cvArrowMeshBehind) {
+    _cvArrowMeshBehind.visible = isCyl && _currentOpacity > 0.001 && _partsOpacity < 0.001;
+    if (_cvArrowMeshBehind.material) _cvArrowMeshBehind.material.opacity = _currentOpacity * 0.35;
   }
   updateCmVisibility();
   applyBlineVisibility();
@@ -858,21 +905,25 @@ function applyBlineVisibility() {
 }
 
 // ─── NGSolve / Netgen surface mesh (fea_mesh payload) ──────────────────────────
-let _ngMeshGroup = null;
+let _ngMeshGroup = null;   // air box wireframe — grid slider
+let _ngSteelGroup = null;  // steel solid skin  — parts (opacity) slider
 
 function clearNgMesh() {
-  if (!_ngMeshGroup) return;
-  scene.remove(_ngMeshGroup);
-  _ngMeshGroup.traverse(o => {
-    if (o.geometry) o.geometry.dispose();
-    if (o.material) o.material.dispose();
-  });
+  for (const grp of [_ngMeshGroup, _ngSteelGroup]) {
+    if (!grp) continue;
+    scene.remove(grp);
+    grp.traverse(o => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) o.material.dispose();
+    });
+  }
   _ngMeshGroup = null;
+  _ngSteelGroup = null;
 }
 
 function applyFeaMesh(data) {
   clearNgMesh();
-  // Switching to the mesh scene: clear voxel + arrow state so only the mesh shows.
+  // Clear voxel geometry and existing arrows so the mesh scene starts clean.
   _posCache.cyl = _posCache.cap = _posCache.pl = _posCache.hs = _posCache.gm = null;
   refreshVoxelMeshes();
   clearCuArrows();
@@ -881,7 +932,8 @@ function applyFeaMesh(data) {
   clearBlines();
 
   const verts = data.vertices ?? [];
-  _ngMeshGroup = new THREE.Group();
+  _ngMeshGroup  = new THREE.Group();   // air box wireframe (grid slider)
+  _ngSteelGroup = new THREE.Group();   // steel solid skin  (parts slider)
 
   if (verts.length) {
     const flat = new Float32Array(verts.length * 3);
@@ -904,44 +956,70 @@ function applyFeaMesh(data) {
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", posAttr);
       geo.setIndex(new THREE.BufferAttribute(idx, 1));
-      geo.computeVertexNormals();
 
       const [r, g, b] = region.color ?? [0.8, 0.82, 0.85];
       const col = new THREE.Color(r, g, b);
-      const solidOp = region.solid_opacity ?? 0.18;
-      const wireOp = region.wire_opacity ?? 0.75;
+      const solidOp = region.solid_opacity ?? 0;
+      const wireOp  = region.wire_opacity  ?? 0;
 
-      const solidMat = new THREE.MeshStandardMaterial({
-        color: col, metalness: 0.2, roughness: 0.7,
-        transparent: true, opacity: solidOp,
-        side: THREE.DoubleSide, depthWrite: false,
-      });
-      solidMat.userData.baseOpacity = solidOp;
-      const wireMat = new THREE.LineBasicMaterial({
-        color: col, transparent: true, opacity: wireOp, depthWrite: false,
-      });
-      wireMat.userData.baseOpacity = wireOp;
-      _ngMeshGroup.add(new THREE.Mesh(geo, solidMat));
-      _ngMeshGroup.add(new THREE.LineSegments(new THREE.WireframeGeometry(geo), wireMat));
+      // ── Mesh slider overlay (all regions, mesh-slider driven) ─────────────
+      geo.computeVertexNormals();
+      if (solidOp > 0.001) {
+        const solidMat = new THREE.MeshStandardMaterial({
+          color: col, metalness: 0.2, roughness: 0.7,
+          transparent: true, opacity: solidOp,
+          side: THREE.DoubleSide, depthWrite: false,
+        });
+        solidMat.userData.baseOpacity = solidOp;
+        _ngMeshGroup.add(new THREE.Mesh(geo, solidMat));
+      }
+      if (wireOp > 0.001) {
+        const wireMat = new THREE.LineBasicMaterial({
+          color: col, transparent: true, opacity: wireOp, depthWrite: false,
+        });
+        wireMat.userData.baseOpacity = wireOp;
+        _ngMeshGroup.add(new THREE.LineSegments(new THREE.WireframeGeometry(geo), wireMat));
+      }
+
+      // ── Parts slider solid skin (steel only, opaque-capable) ──────────────
+      if (region.name === "steel") {
+        // FrontSide only (Netgen normals are consistently outward for a solid).
+        // renderOrder 1: steel renders and writes depth BEFORE arrows (renderOrder 0
+        // in GreaterDepth behind-pass), so the depth test correctly separates
+        // in-front arrows (full opacity) from behind arrows (faded).
+        const mat = new THREE.MeshStandardMaterial({
+          color: col, metalness: 0.35, roughness: 0.55,
+          transparent: true, opacity: _partsOpacity,
+          side: THREE.FrontSide, depthWrite: true,
+        });
+        const steelMesh = new THREE.Mesh(geo, mat);
+        steelMesh.renderOrder = 1;
+        _ngSteelGroup.add(steelMesh);
+      }
     }
   }
+  scene.add(_ngSteelGroup);
   scene.add(_ngMeshGroup);
 
-  // Mesh defaults to visible: nudge the (shared) grid slider up if it's at zero.
-  const gridSl = document.getElementById("metal-opacity-slider");
-  if (gridSl && parseFloat(gridSl.value) < 0.001) {
-    gridSl.value = "1";
-    _metalOpacity = 1.0;
-    const gv = document.getElementById("metal-opacity-val");
-    if (gv) gv.textContent = "1.00";
+  // Wire up coil current arrows (same Cu-arrow scheme as voxel scenes).
+  _feaRunning = false;
+  const vs = data.voxel_size ?? 0.15;
+  _sceneVoxelSize = vs;
+  if (data.cu?.sites?.positions?.length) {
+    _cuFieldBase = _cloneCoilField(data.cu);
+    applyCuField(data.cu, vs);
+  } else {
+    _cuFieldBase = null;
   }
 
-  _hasVoxelScene = true;            // prevent applyMode from re-requesting the scene
-  _activeScene = data.scene_id ?? "ngmesh";
+  _hasVoxelScene = true;
+  _activeScene = data.scene_id ?? "1dipole";
   _cubeCorners = data.frame_config?.cube_corners ?? null;
   if (data.frame_config) buildOuOutline(data.frame_config);
   syncModeSelectFromState();
   applyView();
+  applyOpacityFromSlider();
+  applyCurrentOpacityFromSlider();
   scheduleResize();
 
   const meta = data.meta ?? {};
@@ -959,13 +1037,15 @@ function applyFeaMesh(data) {
 }
 
 function applyGridOpacity() {
-  if (!_ngMeshGroup) return;
-  const g = _metalOpacity;
-  _ngMeshGroup.visible = _currentView === "cylinder" && g > 0.001;
-  _ngMeshGroup.traverse(o => {
-    const base = o.material?.userData?.baseOpacity;
-    if (base != null) o.material.opacity = base * g;
-  });
+  // Air box wireframe — grid (metal-opacity) slider.
+  if (_ngMeshGroup) {
+    const g = _metalOpacity;
+    _ngMeshGroup.visible = _currentView === "cylinder" && g > 0.001;
+    _ngMeshGroup.traverse(o => {
+      const base = o.material?.userData?.baseOpacity;
+      if (base != null) o.material.opacity = base * g;
+    });
+  }
 }
 
 // ─── WebSocket client ──────────────────────────────────────────────────────────
@@ -1068,6 +1148,7 @@ function setLoadStatus(msg) {
   status.style.color = "#d29922";
 }
 
+
 function applyMode(modeId) {
   const mode = MODE_OPTIONS.find(m => m.id === modeId) ?? MODE_OPTIONS[0];
   const prevView  = _currentView;
@@ -1086,15 +1167,18 @@ function applyMode(modeId) {
   const scene = mode.scene ?? "frame";
   const sceneChanged = scene !== prevScene;
 
-  // Always ask server for voxel geometry (fixes connect when server still on spinning_cubes).
-  sendView("cylinder");
+  // Only re-send the view when actually returning from another view. Sending it
+  // on every scene switch makes the server echo the OLD scene first, which
+  // reverts _activeScene/the dropdown mid-switch (looked like "switch twice").
+  if (prevView !== "cylinder") sendView("cylinder");
+
   if (sceneChanged) {
     _activeScene = scene;
     _hasVoxelScene = false;
-    setLoadStatus("Loading scene…");
+    setLoadStatus(`Building ${mode.label}…`);
     sendScene(scene);
   } else if (!_hasVoxelScene) {
-    setLoadStatus("Loading scene…");
+    setLoadStatus(`Building ${mode.label}…`);
     sendScene(scene);
   }
 
@@ -1277,6 +1361,18 @@ function applyOpacityFromSlider() {
   capMat.opacity    = _partsOpacity;
   plateMat.opacity  = _partsOpacity;
   hsMat.opacity     = _partsOpacity;
+  // Steel mesh in the NGSolve scene shares the parts opacity slider.
+  // depthWrite stays true always — the two-pass arrow system relies on the
+  // steel surface being in the depth buffer at any opacity value.
+  if (_ngSteelGroup) {
+    _ngSteelGroup.traverse(o => {
+      if (o.isMesh && o.material) {
+        o.material.opacity = _partsOpacity;
+        o.material.transparent = _partsOpacity < 0.999;
+        o.material.needsUpdate = true;
+      }
+    });
+  }
   applyView();
 }
 

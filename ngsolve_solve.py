@@ -1,7 +1,8 @@
-"""ngsolve_solve.py — Nonlinear magnetostatic solve for the "ngmesh" scene.
+"""ngsolve_solve.py — Nonlinear magnetostatic solve for the dipole scenes.
 
 Solves the magnetic vector-potential A-formulation with H(curl) (Nédélec edge)
-elements on the Netgen mesh from scene_ngmesh:
+elements on the Netgen mesh from any dipole scene (1dipole / 12dipoles_ng) via
+the shared ng_dipoles builder; J is summed over every coil region:
 
     curl( nu(|B|) curl A ) = J
 
@@ -52,38 +53,57 @@ from fea_config import (
     FEA_BLINE_MIN_B_FRAC,
     FEA_BLINE_STOP_FRAC,
 )
-from scene_ngmesh import build_geometry
 from fea_blines import trace_field_lines
 
 _MU0 = 4.0e-7 * pi
 
 
-def _solve_A(mesh, params, mu_r_steel: float, current_scale: float,
-             saturate: bool = True):
-    """Solve curl(nu curl A)=J on the metres mesh. Returns (B_cf, meta).
+def _coil_jdir(ax, c):
+    """Unit azimuthal current direction around axis `ax` through center `c`.
 
-    saturate=True : nonlinear B–H reluctivity in the steel, Newton + current
-                    ramping (physically correct, slower).
-    saturate=False: linear solve at constant nu = 1/(mu0 mu_init) in the steel
-                    (one direct factorization; much faster, no saturation).
+    j_hat = (a × r_hat); since a ⟂ r_hat and |a|=1, |a × r| = |r| = rmag, so
+    dividing the cross product by rmag yields a unit azimuthal field. Matches the
+    single-dipole formula when a = +X, c = (·, c, c).
+    """
+    from ngsolve import x, y, z, CoefficientFunction, sqrt
+    px, py, pz = x - c[0], y - c[1], z - c[2]
+    adp = ax[0] * px + ax[1] * py + ax[2] * pz
+    rx, ry, rz = px - adp * ax[0], py - adp * ax[1], pz - adp * ax[2]
+    rmag = sqrt(rx * rx + ry * ry + rz * rz)
+    tx = ax[1] * rz - ax[2] * ry
+    ty = ax[2] * rx - ax[0] * rz
+    tz = ax[0] * ry - ax[1] * rx
+    return CoefficientFunction((tx, ty, tz)) / rmag
+
+
+def _solve_A_multi(mesh, dipoles, mu_r_steel: float, current_scale: float,
+                   saturate: bool = False):
+    """Solve curl(nu curl A)=J for many coils (each its own material region).
+
+    `dipoles` is the list of per-dipole param dicts from ng_dipoles (must carry
+    coil_mat / center / axis / weight, in the SAME metres units as the mesh).
+    All rods share material "steel" (isotropic nu(|B|), same everywhere); each
+    coil i lives in material "coil{i}" so J can be set per-region with its own
+    axis and signed weight.
     """
     from ngsolve import (
         HCurl, GridFunction, BilinearForm, LinearForm,
-        curl, dx, CoefficientFunction, y, z, sqrt, Parameter,
+        curl, dx, CoefficientFunction, Parameter,
     )
 
-    c = params["center"]
     nu_air = 1.0 / _MU0
-    nu_init = 1.0 / (_MU0 * max(float(mu_r_steel), 1.0))   # unsaturated steel
+    nu_init = 1.0 / (_MU0 * max(float(mu_r_steel), 1.0))
     b_knee2 = float(NG_IRON_B_KNEE_T) ** 2
+    j_unit = float(current_scale) * float(NG_COIL_CURRENT_A_MM2) * 1.0e6
 
-    # Azimuthal current about +X at (·, c, c): phi_hat = x_hat × r_hat = (0,-rz,ry).
-    # Positive → B toward +X (corner c1), per the e14 convention. Coords in metres.
-    ry = y - c
-    rz = z - c
-    rmag = sqrt(ry * ry + rz * rz)
-    jdir = CoefficientFunction((0, -rz, ry)) / rmag
-    j_target = float(current_scale) * float(NG_COIL_CURRENT_A_MM2) * 1.0e6  # A/mm²→A/m²
+    # Per-coil current density CF (full target), keyed by coil material name.
+    j_map = {}
+    for dp in dipoles:
+        w = float(dp.get("weight", 0.0))
+        if abs(w) < 1e-12 or not dp.get("has_coil", True):
+            continue
+        j_map[dp["coil_mat"]] = (w * j_unit) * _coil_jdir(dp["axis"], dp["center"])
+    zero = CoefficientFunction((0, 0, 0))
 
     fes = HCurl(mesh, order=int(NG_SOLVE_ORDER), dirichlet="outer")
     u, v = fes.TnT()
@@ -91,13 +111,11 @@ def _solve_A(mesh, params, mu_r_steel: float, current_scale: float,
     gfu.vec[:] = 0.0
 
     if not saturate:
-        # ── Linear: constant unsaturated permeability, single direct solve ──
         nu_lin = mesh.MaterialCF({"steel": nu_init}, default=nu_air)
-        Jcf = mesh.MaterialCF({"coil": j_target * jdir},
-                              default=CoefficientFunction((0, 0, 0)))
+        Jcf = mesh.MaterialCF(j_map, default=zero) if j_map else zero
         a = BilinearForm(fes)
         a += nu_lin * curl(u) * curl(v) * dx
-        a += 1e-6 * nu_lin * u * v * dx          # regularize gradient null space
+        a += 1e-6 * nu_lin * u * v * dx
         f = LinearForm(fes)
         f += Jcf * v * dx
         t1 = time.perf_counter()
@@ -105,45 +123,37 @@ def _solve_A(mesh, params, mu_r_steel: float, current_scale: float,
         f.Assemble()
         gfu.vec.data = a.mat.Inverse(fes.FreeDofs(), inverse="sparsecholesky") * f.vec
         t_solve = time.perf_counter() - t1
-        meta = {"ndof": int(fes.ndof), "saturated": False,
-                "solve_s": round(t_solve, 2)}
-        return curl(gfu), meta
+        return curl(gfu), {"ndof": int(fes.ndof), "saturated": False,
+                           "n_coils": len(j_map), "solve_s": round(t_solve, 2)}
 
-    # ── Nonlinear: B–H saturation via Newton + current ramping ──────────────
     from ngsolve.solvers import Newton
 
     def nu_iron(b2):
-        # smooth reluctivity sigmoid in |B|^2: nu_init (soft) → nu_air (saturated).
-        # explicit squaring, not **, to avoid pow's log(0) -> NaN at B=0.
         r = b2 / b_knee2
         return nu_air - (nu_air - nu_init) / (1.0 + r * r)
 
-    cur = Parameter(0.0)
-    Jcf = mesh.MaterialCF({"coil": cur * jdir}, default=CoefficientFunction((0, 0, 0)))
+    cur = Parameter(0.0)   # unitless ramp 0 → 1
+    Jbase = mesh.MaterialCF(j_map, default=zero) if j_map else zero
     Bu = curl(u)
     nu_cf = mesh.MaterialCF({"steel": nu_iron(Bu * Bu)}, default=nu_air)
 
-    # Residual (semilinear) form, written in the trial proxy u so Newton can
-    # linearize it around the current iterate.
     a = BilinearForm(fes)
     a += nu_cf * Bu * curl(v) * dx
-    a += 1e-6 * nu_air * u * v * dx          # regularize gradient null space
-    a += -Jcf * v * dx
+    a += 1e-6 * nu_air * u * v * dx
+    a += -(cur * Jbase) * v * dx
 
     n_ramp = max(int(NG_SOLVE_RAMP_STEPS), 1)
     t1 = time.perf_counter()
     for k in range(1, n_ramp + 1):
-        cur.Set(j_target * k / n_ramp)
+        cur.Set(k / n_ramp)
         Newton(
             a, gfu, freedofs=fes.FreeDofs(),
             maxit=int(NG_SOLVE_NEWTON_MAXIT), maxerr=float(NG_SOLVE_NEWTON_TOL),
             inverse="sparsecholesky", dampfactor=1.0, printing=False,
         )
     t_solve = time.perf_counter() - t1
-
-    meta = {"ndof": int(fes.ndof), "saturated": True, "ramp_steps": n_ramp,
-            "solve_s": round(t_solve, 2)}
-    return curl(gfu), meta
+    return curl(gfu), {"ndof": int(fes.ndof), "saturated": True, "ramp_steps": n_ramp,
+                       "n_coils": len(j_map), "solve_s": round(t_solve, 2)}
 
 
 def _sample_B(mesh, B_cf, half_extent_mm: float, step_mm: float, length_scale: float):
@@ -175,30 +185,35 @@ def _sample_B(mesh, B_cf, half_extent_mm: float, step_mm: float, length_scale: f
     }
 
 
-def solve_ng_bfield(*, mu_r: float = 1.0, fea_strength_scale: float = 1.0,
-                    saturate: bool = True) -> dict:
-    """Full NGSolve solve → traced field lines as a "bfield_lines" payload.
+def _run_scene_solve(build_geometry, *, tag: str, mu_r: float,
+                     fea_strength_scale: float, saturate: bool) -> dict:
+    """Shared solve pipeline for any dipole scene.
 
-    saturate=True models B–H saturation (nonlinear Newton); False does a fast
-    linear solve at the unsaturated permeability mu_r.
+    `build_geometry(length_scale)` must return (ngmesh, dipoles, meta) in the
+    ng_dipoles format (dipoles = per-coil param dicts; meta has half_extent +
+    length_scale). Meshes in metres so B = curl(A) is in real Tesla, solves the
+    curl-curl A-formulation (linear or Newton+ramp), samples B and traces lines.
     """
     from ngsolve import Mesh
 
     t0 = time.perf_counter()
-    ngmesh, params = build_geometry(length_scale=1.0e-3)   # metres → B in Tesla
+    ngmesh, dipoles, meta_g = build_geometry(length_scale=1.0e-3)   # metres → Tesla
     mesh = Mesh(ngmesh)
     t_mesh = time.perf_counter() - t0
 
-    length_scale = params["length_scale"]
-    half_extent_mm = params["half_extent"] / length_scale
-
+    length_scale = meta_g["length_scale"]
+    half_extent_mm = meta_g["half_extent"] / length_scale
+    n_active = sum(1 for dp in dipoles
+                   if abs(float(dp.get("weight", 0.0))) > 1e-12 and dp.get("has_coil", True))
     mode = "Newton+saturation" if saturate else "linear"
     print(
-        f"[ng_solve] mesh ready ({t_mesh:.2f}s)  mu_init={mu_r:g}  "
-        f"current_scale={fea_strength_scale:g}  {mode} (order={NG_SOLVE_ORDER})..."
+        f"[ng_solve:{tag}] mesh ready ({t_mesh:.2f}s)  coils_active={n_active}  "
+        f"mu_init={mu_r:g}  current_scale={fea_strength_scale:g}  "
+        f"{mode} (order={NG_SOLVE_ORDER})..."
     )
-    B_cf, solve_meta = _solve_A(mesh, params, mu_r, fea_strength_scale,
-                                saturate=saturate)
+
+    B_cf, solve_meta = _solve_A_multi(mesh, dipoles, mu_r, fea_strength_scale,
+                                      saturate=saturate)
     sol = _sample_B(mesh, B_cf, half_extent_mm, NG_FIELD_SAMPLE_MM, length_scale)
 
     traced = trace_field_lines(
@@ -227,8 +242,25 @@ def solve_ng_bfield(*, mu_r: float = 1.0, fea_strength_scale: float = 1.0,
     mode_note = (f"saturated, {solve_meta['ramp_steps']} ramp steps"
                  if solve_meta.get("saturated") else "linear")
     print(
-        f"[ng_solve] done  ndof={solve_meta['ndof']:,}  solve={solve_meta['solve_s']}s  "
+        f"[ng_solve:{tag}] done  ndof={solve_meta['ndof']:,}  "
+        f"coils={solve_meta.get('n_coils')}  solve={solve_meta['solve_s']}s  "
         f"({mode_note})  lines={meta['n_lines']}/{meta['n_seeds']} "
         f"seeds  max|B|={meta.get('max_B_T', 0.0):.3e} T"
     )
     return {"type": "bfield_lines", "lines": lines_scene, "meta": meta}
+
+
+def solve_ng_bfield(*, mu_r: float = 1.0, fea_strength_scale: float = 1.0,
+                    saturate: bool = True) -> dict:
+    """Solve the single-dipole ("1dipole") scene → "bfield_lines" payload."""
+    from scene_ngmesh import build_geometry
+    return _run_scene_solve(build_geometry, tag="1dipole", mu_r=mu_r,
+                            fea_strength_scale=fea_strength_scale, saturate=saturate)
+
+
+def solve_ng12_bfield(*, mu_r: float = 1.0, fea_strength_scale: float = 1.0,
+                      saturate: bool = False) -> dict:
+    """Solve the 12-dipole scene (many coils) → "bfield_lines" payload."""
+    from scene_ng12dipoles import build_geometry
+    return _run_scene_solve(build_geometry, tag="12dipole", mu_r=mu_r,
+                            fea_strength_scale=fea_strength_scale, saturate=saturate)

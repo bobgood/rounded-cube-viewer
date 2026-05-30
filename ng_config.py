@@ -15,6 +15,18 @@ edge; centrelines are offset inward from that corner edge (see per-scene below).
 
 from __future__ import annotations
 
+from cube_config import FRAME_EDGE_MM, FRAME_INSET_MM
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ SHARED — cube frame (self-contained; no fea_* dependency)                  ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+# The inset cube "skeleton" rods/dipoles are placed on. Corners sit at
+# +/- NG_CUBE_HALF_MM on each axis. For the 32 mm cube with 5 mm inset this is
+# 11 mm, matching the original 1-dipole centreline placement.
+NG_CUBE_HALF_MM = FRAME_EDGE_MM / 2.0 - FRAME_INSET_MM   # half-edge of the skeleton
+NG_CUBE_EDGE_MM = 2.0 * NG_CUBE_HALF_MM                  # full skeleton edge length
+
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ SHARED — mesh density (applies to every NGSolve scene)                     ║
@@ -29,7 +41,7 @@ NG_MESH_MAXH_DEVICE_MM = 1.5
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ SCENE: "ngmesh" — single steel rod + coaxial solenoid coil in air          ║
+# ║ SCENE: "1dipole" — single steel rod + coaxial solenoid coil in air         ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 # ── Metal rod (the ferromagnetic core) ───────────────────────────────────────
@@ -56,17 +68,19 @@ NG_CENTERLINE_OFFSET_FROM_EDGE_MM = 5.0
 # Active size: 22 mm padding → a 76 mm air cube around the 32 mm envelope.
 NG_AIR_PADDING_MM = 22.0
 
-# ── Coil current (magnetostatic source) ──────────────────────────────────────
-# Fixed coil current density magnitude (A/mm^2). The direction follows the cube
-# edge convention: positive current on edge e{c1}{c2} circulates so B points
-# toward the FIRST-named corner (e14 here → B toward corner 1, i.e. +X). This
-# single-coil scene sits on edge e14; a future 12-coil scene will set a signed
-# weight per edge (J["e12"]=1.0, ...) and reuse the same convention.
-# This is an effective ampere-turn density (N*I/area) for a multi-turn winding,
-# not a single bare conductor, so the large value is physical. The "Strength"
-# slider (fea_strength_scale) multiplies it; at this base the rod sits near the
-# saturation knee, so the slider sweeps from soft-iron to fully saturated.
-NG_COIL_EDGE = "e14"
+# ── Coil current weights (one entry per coil, same convention as coil_init.py) ──
+# Key = edge label e{c1}{c2}: positive → B toward the FIRST-named corner.
+# Sign controls current direction (and therefore field polarity).
+# |value| is a relative weight; the solver multiplies by NG_COIL_CURRENT_A_MM2.
+# Set an edge to 0.0 to disable that coil entirely (no arrows, no J).
+# The Strength slider (fea_strength_scale) is a further global multiplier.
+# Example: {"e14": 1.0} drives the single coil on edge e14 in the +direction.
+# A future 12-coil scene would list all 12 edges: {"e12": 1.0, "e15": -1.0, ...}
+NG_COIL_CURRENTS: dict = {"e14": 1.0}
+
+# Base current density (A/mm²) for each unit-weight coil turn.
+# This is an effective ampere-turn density for a multi-turn winding — large
+# by design so the rod sits near the saturation knee at Strength=1.
 NG_COIL_CURRENT_A_MM2 = 120.0
 
 # ── Iron B–H saturation (nonlinear magnetostatics) ───────────────────────────
@@ -97,8 +111,44 @@ NG_FIELD_SAMPLE_MM = 2.0
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ FUTURE SCENES — add new scene constants below                              ║
-# ║ Keep each scene's geometry/mesh knobs in their own labelled block here so  ║
-# ║ this file stays the one place to tweak anything NGSolve builds.            ║
+# ║ SCENE: "12dipoles" — a steel rod + coil on each of the 12 cube edges        ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
-# (none yet)
+# Twelve dipoles, one centred on each edge of the (inset) cube skeleton. Each
+# rod is shorter than its edge and centred on the edge midpoint. All bodies use
+# the same cross-section; only placement/orientation and coil current differ.
+#
+# Cube-corner frame (self-contained — no fea_* dependency)
+# --------------------------------------------------------
+# The 8 skeleton corners sit at +/- NG_CUBE_HALF_MM on each axis, where
+# NG_CUBE_HALF_MM = FRAME_EDGE_MM/2 - FRAME_INSET_MM (= 11 mm for the 32 mm cube
+# with 5 mm inset). Corner numbering matches geometry_ids (c1..c8); see
+# ng_dipoles.cube_corner_positions(). Edge e{a}{b} runs from corner a to b and
+# its coil's +current drives B toward the FIRST-named corner a.
+
+# ── Rod + coil cross-section (shared by all 12 dipoles) ──────────────────────
+NG12_ROD_RADIUS_MM      = 3.5   # steel rod outer radius (mm)
+NG12_COIL_CLEARANCE_MM  = 0.5   # radial gap rod OD → coil ID (mm)
+NG12_COIL_THICKNESS_MM  = 1.2   # radial coil sleeve thickness (mm)
+# Coil inner/outer radius are derived from the above:
+#   inner = rod_radius + clearance ; outer = inner + thickness.
+
+# ── Axial sizing (each rod/coil is centred on its edge midpoint) ─────────────
+# The inset skeleton edge is NG_CUBE_EDGE_MM long (= 2*NG_CUBE_HALF_MM = 22 mm).
+# Rod/coil are shorter than the edge so neighbouring dipoles don't touch at the
+# corners; remaining length is split as an equal gap at each end.
+NG12_ROD_LENGTH_MM   = 11.0   # rod length along its edge (mm), centred
+NG12_COIL_LENGTH_MM  = 11.0   # coil length along its edge (mm), centred
+
+# ── Per-edge coil current weights (signed; same convention as NG_COIL_CURRENTS) ─
+# Key = edge label e{a}{b}; +weight → B toward the first-named corner a.
+# 0.0 disables that coil's arrows/current (the rod is still drawn). The Strength
+# slider scales all of these; NG_COIL_CURRENT_A_MM2 is the per-unit base density.
+# Default mirrors the old voxel 12-dipole demo: the four vertical struts driven.
+NG12_COIL_CURRENTS: dict = {
+    # Top ring (+Z):    e12  e23  e34  e41
+    "e12": 0.0, "e23": 0.0, "e34": 0.0, "e41": 0.0,
+    # Bottom ring (−Z): e56  e67  e78  e85
+    "e56": 0.0, "e67": 0.0, "e78": 0.0, "e85": 0.0,
+    # Vertical struts:  e15  e26  e37  e48
+    "e15": 1.0, "e26": 1.0, "e37": 1.0, "e48": 1.0,
+}

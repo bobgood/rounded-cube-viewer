@@ -142,10 +142,16 @@ async def handler(ws):
                           f"strength_scale={scale}  mu_r={mu_r:g}  saturate={saturate}")
                     await ws.send(json.dumps({"type": "bfield_status", "state": "solving"}))
                     try:
-                        if _active_scene == "ngmesh":
+                        if _active_scene == "1dipole":
                             from ngsolve_solve import solve_ng_bfield
                             payload = await asyncio.to_thread(
                                 solve_ng_bfield, mu_r=mu_r, fea_strength_scale=scale,
+                                saturate=saturate,
+                            )
+                        elif _active_scene == "12dipoles_ng":
+                            from ngsolve_solve import solve_ng12_bfield
+                            payload = await asyncio.to_thread(
+                                solve_ng12_bfield, mu_r=mu_r, fea_strength_scale=scale,
                                 saturate=saturate,
                             )
                         else:

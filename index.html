@@ -181,10 +181,11 @@
           <div class="panel-title">Mode</div>
           <label class="mode-label">
             <select id="mode-select">
-              <option value="cylinder:ngmesh">NGSolve mesh (rod + coil)</option>
+              <option value="cylinder:1dipole">1 dipole</option>
+              <option value="cylinder:12dipoles_ng">12 dipoles</option>
               <option value="cylinder:frame">30 coils experiment</option>
-              <option value="cylinder:dipole">Dipole (e12 rod + coil)</option>
-              <option value="cylinder:12dipoles">12 dipoles (all edges)</option>
+              <option value="cylinder:dipole">Dipole (voxel)</option>
+              <option value="cylinder:12dipoles">12 dipoles (voxel)</option>
               <option value="spinning_cubes">Spinning cubes</option>
             </select>
           </label>
@@ -207,8 +208,8 @@
             <input type="range" id="opacity-slider" min="0" max="1" step="0.01" value="0.5">
             <span class="val" id="opacity-val">0.50</span>
           </label>
-          <label title="NGSolve mesh / grid opacity (also Gm debug grid in voxel scenes)">
-            Grid
+          <label title="NGSolve mesh opacity — all 3 regions (steel grey, coil amber, air blue). Also controls Gm debug grid in voxel scenes.">
+            Mesh
             <input type="range" id="metal-opacity-slider" min="0" max="1" step="0.01" value="0">
             <span class="val" id="metal-opacity-val">0.00</span>
           </label>
