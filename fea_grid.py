@@ -28,17 +28,19 @@ def _grid_bounds(
     outer_height_mm: float,
     h: float,
     pad_mm: float,
+    center_mm: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> tuple[int, int, int, int, int, int, int, int, int]:
+    cx, cy, cz = float(center_mm[0]), float(center_mm[1]), float(center_mm[2])
     pad_cells = max(1, int(math.ceil(float(pad_mm) / h)))
     hx = outer_edge_mm / 2.0 + pad_mm
     hy = outer_height_mm / 2.0 + pad_mm
     hz = outer_edge_mm / 2.0 + pad_mm
-    env_ix0 = int(math.floor(-hx / h)) - pad_cells
-    env_ix1 = int(math.ceil(hx / h)) + pad_cells
-    env_iy0 = int(math.floor(-hy / h)) - pad_cells
-    env_iy1 = int(math.ceil(hy / h)) + pad_cells
-    env_iz0 = int(math.floor(-hz / h)) - pad_cells
-    env_iz1 = int(math.ceil(hz / h)) + pad_cells
+    env_ix0 = int(math.floor((cx - hx) / h)) - pad_cells
+    env_ix1 = int(math.ceil((cx + hx) / h)) + pad_cells
+    env_iy0 = int(math.floor((cy - hy) / h)) - pad_cells
+    env_iy1 = int(math.ceil((cy + hy) / h)) + pad_cells
+    env_iz0 = int(math.floor((cz - hz) / h)) - pad_cells
+    env_iz1 = int(math.ceil((cz + hz) / h)) + pad_cells
 
     key_list = list(keys)
     if not key_list:
@@ -78,6 +80,7 @@ def build_fea_grid(
     coil_material_id: int = 2,
     coil_mu_r: float = 1.0,
     copper_voxels: list | None = None,
+    center_mm: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> dict:
     """Build lattice grid: steel union + coil cells (Cu pipe + Cv sleeves) with J.
 
@@ -107,7 +110,11 @@ def build_fea_grid(
     _add_steel(plate_raw)
     _add_steel(hs_raw)
 
-    coil_j: dict[tuple[int, int, int], tuple[float, float, float, float]] = {}
+    # Accumulate J vectors from all fine-grid voxels that map to the same coarse
+    # lattice cell, then average.  A plain overwrite (last-wins) breaks azimuthal
+    # symmetry when many fine voxels at different angles collapse into one coarse cell
+    # (most visible at the 2 mm B-line grid resolution).
+    coil_j_acc: dict[tuple[int, int, int], list] = {}  # key -> [jx, jy, jz, cw, count]
     for entry in coil_voxels:
         if len(entry) >= 7:
             x, y, z, jx, jy, jz, cw = entry[:7]
@@ -115,7 +122,20 @@ def build_fea_grid(
             x, y, z, jx, jy, jz = entry[:6]
             cw = 1.0
         key = _lattice_index(x, y, z, h)
-        coil_j[key] = (float(jx), float(jy), float(jz), float(cw))
+        if key in coil_j_acc:
+            acc = coil_j_acc[key]
+            acc[0] += float(jx)
+            acc[1] += float(jy)
+            acc[2] += float(jz)
+            acc[3] += float(cw)
+            acc[4] += 1
+        else:
+            coil_j_acc[key] = [float(jx), float(jy), float(jz), float(cw), 1]
+
+    coil_j: dict[tuple[int, int, int], tuple[float, float, float, float]] = {
+        key: (acc[0] / acc[4], acc[1] / acc[4], acc[2] / acc[4], acc[3] / acc[4])
+        for key, acc in coil_j_acc.items()
+    }
 
     all_keys = steel | set(coil_j.keys())
     if not all_keys:
@@ -123,7 +143,7 @@ def build_fea_grid(
                            coil_material_id, coil_mu_r)
 
     ix0, iy0, iz0, nx, ny, nz, _, _, _ = _grid_bounds(
-        all_keys, outer_edge_mm, outer_height_mm, h, pad_mm,
+        all_keys, outer_edge_mm, outer_height_mm, h, pad_mm, center_mm=center_mm,
     )
 
     skipped = 0

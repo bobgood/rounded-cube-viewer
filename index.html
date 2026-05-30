@@ -12,38 +12,81 @@
         font-family: system-ui, sans-serif;
         background: #0d1117;
       }
-      #app { width: 100%; height: 100%; }
 
-      /* ── Control panel ── */
+      #layout {
+        display: flex;
+        width: 100%;
+        height: 100%;
+      }
+
+      /* 3D view: all space left of the panel */
+      #viewport {
+        flex: 1;
+        min-width: 0;
+        position: relative;
+        overflow: hidden;
+        background: #0d1117;
+      }
+      #app {
+        width: 100%;
+        height: 100%;
+      }
+      #app canvas {
+        display: block;
+      }
+
+      /* Full-height right rail (scroll if tall) */
       #controls {
-        position: fixed;
-        top: 12px; right: 12px;
-        background: rgba(13,17,23,0.88);
-        border: 1px solid #30363d;
-        border-radius: 8px;
-        padding: 12px 16px;
+        flex: 0 0 188px;
+        width: 188px;
+        height: 100%;
+        overflow-x: hidden;
+        overflow-y: auto;
+        background: #0d1117;
+        border-left: 1px solid #30363d;
+        padding: 10px 10px 16px;
         color: #c9d1d9;
-        font-size: 13px;
+        font-size: 12px;
         display: flex;
         flex-direction: column;
-        gap: 10px;
-        min-width: 210px;
-        backdrop-filter: blur(6px);
+        gap: 8px;
       }
+      #controls::-webkit-scrollbar { width: 8px; }
+      #controls::-webkit-scrollbar-thumb {
+        background: #30363d;
+        border-radius: 4px;
+      }
+
+      #controls .panel-title {
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: #8b949e;
+        margin-bottom: 2px;
+      }
+
       #controls label {
         display: flex;
         justify-content: space-between;
         align-items: center;
-        gap: 10px;
+        gap: 6px;
+      }
+      #controls label.mode-label {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 4px;
       }
       #controls input[type=range] {
         flex: 1;
+        min-width: 0;
         accent-color: #3d8bfd;
       }
       #controls span.val {
-        min-width: 36px;
+        flex: 0 0 32px;
         text-align: right;
         color: #8b949e;
+        font-size: 11px;
       }
       #controls select {
         width: 100%;
@@ -51,52 +94,49 @@
         border: 1px solid #30363d;
         color: #c9d1d9;
         border-radius: 6px;
-        padding: 4px 6px;
-        font-size: 13px;
+        padding: 5px 6px;
+        font-size: 12px;
         cursor: pointer;
+      }
+
+      .control-section.hidden { display: none; }
+
+      #restart-btn, #solve-btn {
+        width: 100%;
+        border-radius: 6px;
+        padding: 6px 0;
+        cursor: pointer;
+        font-size: 12px;
       }
       #restart-btn {
         background: #21262d;
         border: 1px solid #30363d;
         color: #c9d1d9;
-        border-radius: 6px;
-        padding: 6px 0;
-        cursor: pointer;
-        font-size: 13px;
-        transition: background 0.15s;
       }
       #restart-btn:hover { background: #30363d; }
+      #solve-btn {
+        background: #1f6feb;
+        border: 1px solid #388bfd;
+        color: #fff;
+        font-weight: 600;
+      }
+      #solve-btn:hover { background: #388bfd; }
+      #solve-btn:disabled {
+        background: #30363d;
+        border-color: #30363d;
+        color: #8b949e;
+        cursor: default;
+      }
+      #solve-status {
+        font-size: 11px;
+        color: #8b949e;
+        min-height: 14px;
+        text-align: center;
+      }
 
-      /* ── Scene checklist (two rows) ── */
-      #scene-checklist {
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-      }
-      .scene-checklist-row {
-        display: flex;
-        flex-direction: row;
-        gap: 10px;
-        flex-wrap: wrap;
-        align-items: center;
-      }
-      .cl-item {
-        display: flex;
-        align-items: center;
-        gap: 4px;
-        cursor: pointer;
-        white-space: nowrap;
-      }
-      .cl-item input[type=checkbox] {
-        accent-color: #3d8bfd;
-        cursor: pointer;
-      }
-      .cl-item label { cursor: pointer; }
-
-      /* ── Hover info ── */
       #hover-info {
-        position: fixed;
-        bottom: 40px;
+        position: absolute;
+        bottom: 36px;
         left: 12px;
         background: rgba(13,17,23,0.80);
         border: 1px solid #30363d;
@@ -106,82 +146,108 @@
         font-size: 13px;
         font-family: monospace;
         pointer-events: none;
-        min-height: 26px;
-        min-width: 60px;
+        z-index: 2;
       }
-
-      /* ── Hint bar ── */
       #hint {
-        position: fixed;
+        position: absolute;
         left: 12px;
-        bottom: 12px;
+        bottom: 10px;
         color: #8b949e;
-        font-size: 12px;
-        line-height: 1.5;
+        font-size: 11px;
+        line-height: 1.4;
         pointer-events: none;
+        z-index: 2;
       }
     </style>
   </head>
   <body>
-    <div id="app"></div>
-
-    <div id="controls">
-
-      <!-- View selector -->
-      <select id="view-select">
-        <option value="cylinder">Cylinder view</option>
-        <option value="spinning_cubes">Spinning cubes</option>
-      </select>
-
-      <!-- Scene element checklist — populated by JS (two rows) -->
-      <div id="scene-checklist">
-        <div class="scene-checklist-row" id="scene-checklist-row1"></div>
-        <div class="scene-checklist-row" id="scene-checklist-row2"></div>
+    <div id="layout">
+      <div id="viewport">
+        <div id="app"></div>
+        <div id="hover-info"></div>
+        <div id="hint">Hover face → corner (c1–c8) · Peel to see inside</div>
       </div>
 
-      <!-- Transparency -->
-      <label title="Cy, Ca, Pl, Hs voxel layers">
-        Parts
-        <input type="range" id="opacity-slider" min="0" max="1" step="0.01" value="0.5">
-        <span class="val" id="opacity-val">0.50</span>
-      </label>
-      <label title="Gm union metal grid">
-        Metal (Gm)
-        <input type="range" id="metal-opacity-slider" min="0" max="1" step="0.01" value="0.5">
-        <span class="val" id="metal-opacity-val">0.50</span>
-      </label>
+      <aside id="controls">
+        <div>
+          <div class="panel-title">Mode</div>
+          <label class="mode-label">
+            <select id="mode-select">
+              <option value="cylinder:frame">30 coils experiment</option>
+              <option value="cylinder:dipole">Dipole (e12 rod + coil)</option>
+              <option value="cylinder:12dipoles">12 dipoles (all edges)</option>
+              <option value="spinning_cubes">Spinning cubes</option>
+            </select>
+          </label>
+        </div>
 
-      <!-- Hide voxels near the camera (peel shell to see inside) -->
-      <label title="Hides voxels closer than this distance to the camera">
-        Peel (cam)
-        <input type="range" id="peel-slider" min="0" max="6.5" step="0.02" value="0">
-        <span class="val" id="peel-val">0.00</span>
-      </label>
+        <label title="Scales coil_init currents (click Restart after changing)">
+          Strength
+          <input type="range" id="strength-slider" min="0" max="2" step="0.05" value="1">
+          <span class="val" id="strength-val">1.00</span>
+        </label>
 
-      <!-- Physics sliders (Python reads & can use or ignore) -->
-      <label>
-        Spin
-        <input type="range" id="spin-slider" min="0" max="5" step="0.1" value="0.8">
-        <span class="val" id="spin-val">0.8</span>
-      </label>
-      <label>
-        Damping
-        <input type="range" id="damp-slider" min="0.90" max="1.00" step="0.001" value="0.985">
-        <span class="val" id="damp-val">0.985</span>
-      </label>
-      <label>
-        Strength
-        <input type="range" id="strength-slider" min="0" max="2" step="0.05" value="0.4">
-        <span class="val" id="strength-val">0.40</span>
-      </label>
+        <div id="cylinder-controls" class="control-section">
+          <label title="Cube envelope outline (Ou)">
+            Ou outline
+            <input type="range" id="ou-opacity-slider" min="0" max="1" step="0.01" value="0.35">
+            <span class="val" id="ou-opacity-val">0.35</span>
+          </label>
+          <label title="Cy, Ca, Pl, Hs structural voxels">
+            Parts
+            <input type="range" id="opacity-slider" min="0" max="1" step="0.01" value="0.5">
+            <span class="val" id="opacity-val">0.50</span>
+          </label>
+          <label title="Gm union metal (FEA debug grid)">
+            Metal
+            <input type="range" id="metal-opacity-slider" min="0" max="1" step="0.01" value="0">
+            <span class="val" id="metal-opacity-val">0.00</span>
+          </label>
+          <label title="Cu / Cv current arrows">
+            Current
+            <input type="range" id="current-opacity-slider" min="0" max="1" step="0.01" value="0.85">
+            <span class="val" id="current-opacity-val">0.85</span>
+          </label>
+          <label title="Cm coil-grid J arrows (debug)">
+            Cur debug
+            <input type="range" id="current-debug-opacity-slider" min="0" max="1" step="0.01" value="0">
+            <span class="val" id="current-debug-opacity-val">0.00</span>
+          </label>
+          <label title="Traced B-field lines">
+            B lines
+            <input type="range" id="bline-opacity-slider" min="0" max="1" step="0.01" value="0.9">
+            <span class="val" id="bline-opacity-val">0.90</span>
+          </label>
+          <label title="Hides voxels closer than this distance to the camera">
+            Peel (cam)
+            <input type="range" id="peel-slider" min="0" max="6.5" step="0.02" value="0">
+            <span class="val" id="peel-val">0.00</span>
+          </label>
+          <label title="Steel permeability for B-line solve (log scale); 1 = air">
+            Steel μ
+            <input type="range" id="bline-mu-slider" min="0" max="1" step="0.001" value="0">
+            <span class="val" id="bline-mu-val">1</span>
+          </label>
+          <button id="solve-btn">Solve B field</button>
+          <div id="solve-status"></div>
+        </div>
 
-      <button id="restart-btn">&#8635; Restart</button>
+        <div id="spin-controls" class="control-section hidden">
+          <label>
+            Spin
+            <input type="range" id="spin-slider" min="0" max="5" step="0.1" value="0.8">
+            <span class="val" id="spin-val">0.8</span>
+          </label>
+          <label>
+            Damping
+            <input type="range" id="damp-slider" min="0.90" max="1.00" step="0.001" value="0.985">
+            <span class="val" id="damp-val">0.985</span>
+          </label>
+        </div>
+
+        <button id="restart-btn">Restart</button>
+      </aside>
     </div>
-
-    <!-- Hover label -->
-    <div id="hover-info"></div>
-
-    <div id="hint">Peel (cam) &nbsp;·&nbsp; Gm/Cm = FEA debug &nbsp;·&nbsp; Cu/Cv = coil display</div>
 
     <script type="module" src="/main.js"></script>
   </body>

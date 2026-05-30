@@ -29,17 +29,19 @@ Scene message format
   "cv":        { "objects", "sites": { ... }, "color_positive", "color_negative" }
   "fea_grid":  { origin, size, metal (Gm steel debug), cells { steel, copper + J_mm } }
 }
-Each "objects" list: [{"id":"cy0","label":"E12","start":0,"count":N}, ...]
+Each "objects" list: [{"id":"cy0","label":"e12","start":0,"count":N}, ...]
 Cube (n=4): corners C1–C8, edges E12, faces F1234 (clockwise corner ids).
 Plate ids use the format  F{face}{quad}  e.g. "F0A", "F3C".
 """
 
 import json
 import math
+import time
 
 from fea_config import (
     VOXEL_SIZE_MM,
     CYLINDER_LENGTH_MM,
+    CYLINDER_SPLIT_GAP_MM,
     CYLINDER_RADIUS_MM,
     CYLINDER_COLOR,
     CAP_DIAMETER_MM,
@@ -55,6 +57,7 @@ from fea_config import (
     SPIN_WHEEL_OFFSET_MM,
     PLATE_EDGE_INSET_MM,
     PLATE_COLOR,
+    FEA_FACE_PLATES_ENABLED,
     OU_COLOR,
     HOLE_DIAMETER_MM,
     HO_COLOR,
@@ -89,58 +92,42 @@ from fea_config import (
     FEA_COIL_MU_R,
     FEA_CURRENT_NOM_A_MM2,
     FEA_GRID_DEBUG_COLOR,
+    FEA_SOLVE_ENABLED,
+    FEA_BLINE_VOXEL_MM,
+    FEA_BLINE_PAD_MM,
+    FEA_BLINE_MAX_LINES,
+    FEA_BLINE_STEP_MM,
+    FEA_BLINE_MAX_STEPS,
+    FEA_BLINE_SEED_STRIDE,
+    FEA_BLINE_MIN_B_FRAC,
+    FEA_BLINE_STOP_FRAC,
+    FEA_BLINE_MU_R,
 )
 
 from coil_init import cu_coil_weight, cv_coil_key, cv_coil_weight, export_coil_table
 from fea_grid import build_fea_grid
-
-
-# ── Cube topology labels (FRAME_SIDES == 4 only) ─────────────────────────────
-# +Z face viewed from outside: corners 1,2,3,4 clockwise at vertices k0,k3,k2,k1.
-# Bottom face: 5–8 at the same k indices.  Edge Eab connects corners a and b.
-
-_CUBE_CORNER_BY_K_TOP = (1, 4, 3, 2)
-
-_CUBE_FACE_CLOCKWISE = (
-    "1234",  # +Z
-    "5678",  # -Z
-    "1265",  # +X
-    "3487",  # -X
-    "1485",  # +Y
-    "3276",  # -Y
+from fea_solve import solve_magnetostatic, solve_b_arrays
+from fea_blines import trace_field_lines
+from geometry_ids import (
+    CORNER_BY_K_TOP,
+    FACE_CLOCKWISE as _CUBE_FACE_CLOCKWISE,
+    corner_id as _cube_corner,
+    face_label as _cube_face_label,
+    ring_edge_label as _cube_ring_edge_label,
+    strut_edge_label as _cube_strut_edge_label,
 )
-
-
-def _cube_corner(k: int, z_sign: int) -> int:
-    c = _CUBE_CORNER_BY_K_TOP[k % 4]
-    return c if z_sign > 0 else c + 4
+from scene_render import fea_grid_payload, frame_config_dict, scene_point_mm, to_scene_mm
 
 
 def _scene_point(x_mm: float, y_mm: float, z_mm: float, sc: float) -> list:
-    return [round(x_mm * sc, 3), round(y_mm * sc, 3), round(z_mm * sc, 3)]
-
-
-def _cube_ring_edge_label(k: int, z_sign: int) -> str:
-    """Directed along polygon edge k → (k+1); reverse name is the other end (e.g. E14 / E41)."""
-    c1 = _cube_corner(k, z_sign)
-    c2 = _cube_corner((k + 1) % 4, z_sign)
-    return f"E{c1}{c2}"
-
-
-def _cube_strut_edge_label(k: int) -> str:
-    """Top corner → bottom corner (e.g. E15; opposite end E51)."""
-    return f"E{_cube_corner(k, +1)}{_cube_corner(k, -1)}"
-
-
-def _cube_face_label(face_index: int) -> str:
-    return "F" + _CUBE_FACE_CLOCKWISE[face_index]
+    return scene_point_mm(x_mm, y_mm, z_mm, sc)
 
 
 def _cube_corner_positions_mm(vertices, half_h: float) -> dict:
     pos: dict = {}
     for k in range(4):
         vx, vy = vertices[k]
-        c = _CUBE_CORNER_BY_K_TOP[k]
+        c = CORNER_BY_K_TOP[k]
         pos[c] = (vx, vy, half_h)
         pos[c + 4] = (vx, vy, -half_h)
     return pos
@@ -160,18 +147,25 @@ def _closest_corner(face_corner_ids, corner_pos_mm, x, y, z) -> int:
 
 # ── Primitive voxel generators ───────────────────────────────────────────────
 
-def _cylinder_voxels_x(length_mm, radius_mm=None, step=VOXEL_SIZE_MM):
-    """Solid cylinder along the +X axis, centred at origin."""
+def _cylinder_voxels_x(length_mm, radius_mm=None, step=VOXEL_SIZE_MM,
+                       split_gap_mm=0.0):
+    """Solid cylinder along the +X axis, centred at origin.
+
+    split_gap_mm: when > 0, omit voxels with |x| < split_gap_mm/2 (centre air gap).
+    """
     if radius_mm is None:
         radius_mm = CYLINDER_RADIUS_MM
     half_l = length_mm / 2.0
     r_sq   = radius_mm ** 2
     n_l    = int(half_l    / step)
     n_r    = int(radius_mm / step)
+    half_gap = max(0.0, float(split_gap_mm)) / 2.0
     voxels = []
     for ix in range(-n_l, n_l + 1):
         x = ix * step
         if abs(x) > half_l:
+            continue
+        if half_gap > 0.0 and abs(x) < half_gap:
             continue
         for iy in range(-n_r, n_r + 1):
             y = iy * step
@@ -599,8 +593,8 @@ def _build_cv_edge_coils(vertices, half_h, weight_scale: float = 1.0):
             continue
 
         ends = (
-            (p1, True,  c1, c2, f"E{c1}{c2}"),
-            (p2, False, c2, c1, f"E{c2}{c1}"),
+            (p1, True,  c1, c2, f"e{c1}{c2}"),
+            (p2, False, c2, c1, f"e{c2}{c1}"),
         )
         for anchor, from_c1, near_c, far_c, label in ends:
             weight = _display(cv_coil_weight(near_c, label))
@@ -696,8 +690,8 @@ def _build_cv_edge_coil_voxels(vertices, half_h, weight_scale: float = 1.0) -> l
         if length < 2.0 * gap + ext + 0.5:
             continue
         ends = (
-            (p1, True,  c1, c2, f"E{c1}{c2}"),
-            (p2, False, c2, c1, f"E{c2}{c1}"),
+            (p1, True,  c1, c2, f"e{c1}{c2}"),
+            (p2, False, c2, c1, f"e{c2}{c1}"),
         )
         for anchor, from_c1, near_c, far_c, label in ends:
             weight = _display(cv_coil_weight(near_c, label))
@@ -829,17 +823,106 @@ def _skeleton_dims(outer_edge_mm, outer_height_mm, inset_mm, sides, gap_mm):
 # ── Scene builder ─────────────────────────────────────────────────────────────
 
 _scene_cache = None
+_last_fea_inputs = None
 
 
 def invalidate_cache():
     global _scene_cache
     _scene_cache = None
+    try:
+        from scene_dipole import invalidate_cache as _inv_dip
+        _inv_dip()
+    except ImportError:
+        pass
 
 
-def build_voxel_scene(force=False, fea_strength_scale=1.0):
-    """Build (or return cached) the complete voxel scene dict.
+def build_bfield_lines(
+    fea_strength_scale: float = 1.0,
+    voxel_mm: float = FEA_BLINE_VOXEL_MM,
+    pad_mm: float = FEA_BLINE_PAD_MM,
+    mu_r: float = FEA_BLINE_MU_R,
+):
+    """Solve B on a coarse, air-padded grid and trace field-line polylines.
 
-    Coil colors/intensities come from coil_init.COIL (not fea_config).
+    Returns a dict ready to ship to the viewer:
+      { "type": "bfield_lines", "lines": [[[x,y,z],...], ...] (scene units),
+        "meta": {...} }
+    Coordinates are in Three.js scene units (mm * MM_TO_SCENE), matching the
+    rest of the voxel scene. Call build_voxel_scene(force=True, fea_strength_scale)
+    first so _last_fea_inputs holds the scaled coil currents.
+    """
+    if _last_fea_inputs is None:
+        build_voxel_scene(force=True, fea_strength_scale=fea_strength_scale)
+    src = _last_fea_inputs
+    if src is None:
+        return {"type": "bfield_lines", "lines": [], "meta": {"error": "no FEA inputs"}}
+
+    # Centre the B-line domain on the coil centroid so padding is equal on all sides.
+    # For a symmetric frame the centroid ≈ origin; for an off-centre dipole this prevents
+    # unequal Neumann image distances that squash one lobe of the dipole field.
+    coil_voxels = src["coil_voxels"]
+    if coil_voxels:
+        n_cv = len(coil_voxels)
+        cx = sum(v[0] for v in coil_voxels) / n_cv
+        cy = sum(v[1] for v in coil_voxels) / n_cv
+        cz = sum(v[2] for v in coil_voxels) / n_cv
+        coil_center: tuple[float, float, float] = (cx, 0.0, cz)  # keep y=0 (full axial extent)
+    else:
+        coil_center = (0.0, 0.0, 0.0)
+
+    field_grid = build_fea_grid(
+        src["cyl_raw"], src["cap_raw"], src["plate_raw"], src["hs_raw"],
+        coil_voxels=coil_voxels,
+        outer_edge_mm=src["outer_edge_mm"],
+        outer_height_mm=src["outer_height_mm"],
+        voxel_size_mm=voxel_mm,
+        pad_mm=pad_mm,
+        steel_material_id=FEA_METAL_MATERIAL_ID,
+        steel_mu_r=float(mu_r),
+        coil_material_id=FEA_COIL_MATERIAL_ID,
+        coil_mu_r=FEA_COIL_MU_R,
+        center_mm=coil_center,
+    )
+    nx, ny, nz = field_grid["size"]
+    print(
+        f"[fea] B-line field grid {nx}x{ny}x{nz} "
+        f"(voxel={voxel_mm}mm pad={pad_mm}mm steel_mu_r={mu_r:g} "
+        f"center=({coil_center[0]:.1f},{coil_center[1]:.1f},{coil_center[2]:.1f})) solving..."
+    )
+    sol = solve_b_arrays(field_grid)
+    traced = trace_field_lines(
+        sol,
+        max_lines=FEA_BLINE_MAX_LINES,
+        step_mm=FEA_BLINE_STEP_MM,
+        max_steps=FEA_BLINE_MAX_STEPS,
+        seed_stride=FEA_BLINE_SEED_STRIDE,
+        min_B_frac=FEA_BLINE_MIN_B_FRAC,
+        stop_frac=FEA_BLINE_STOP_FRAC,
+    )
+
+    sc = MM_TO_SCENE
+    # Each point: [x, y, z, b_norm]; b_norm in [0,1] for strength colouring.
+    lines_scene = [
+        [[round(x * sc, 3), round(y * sc, 3), round(z * sc, 3), round(b, 3)]
+         for (x, y, z, b) in poly]
+        for poly in traced["lines"]
+    ]
+    meta = dict(traced["meta"])
+    meta["size"] = [nx, ny, nz]
+    meta["voxel_mm"] = voxel_mm
+    meta["pad_mm"] = pad_mm
+    meta["mu_r"] = float(mu_r)
+    print(
+        f"[fea] B lines: {meta['n_lines']} traced from {meta['n_seeds']} seeds  "
+        f"max|B|={meta.get('max_B_T', 0.0):.3e} T"
+    )
+    return {"type": "bfield_lines", "lines": lines_scene, "meta": meta}
+
+
+def build_frame_scene(force=False, fea_strength_scale=1.0):
+    """Build (or return cached) the full frame voxel scene dict.
+
+    Coil colors/intensities come from coil_init.SCENE_COILS (not fea_config).
     fea_strength_scale multiplies every coil_init weight before J is filled on the
     grid (fea_start / Strength slider → server rebuilds scene with scaled weights).
     """
@@ -861,9 +944,18 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
     gap_ring   = sk["gap_ring"]
     gap_strut  = sk["gap_strut"]
 
+    cyl_split = max(0.0, float(CYLINDER_SPLIT_GAP_MM))
+    if cyl_split > 0.0:
+        if cyl_split >= ring_len or cyl_split >= vert_len:
+            print(
+                f"[fea] warning: CYLINDER_SPLIT_GAP_MM={cyl_split} "
+                f">= rod length (ring={ring_len}, strut={vert_len}); clamping"
+            )
+        cyl_split = min(cyl_split, ring_len * 0.99, vert_len * 0.99)
+
     # Templates (along X axis; strut is re-mapped to Z axis below)
-    ring_tpl       = _cylinder_voxels_x(ring_len)
-    vert_tpl       = _cylinder_voxels_x(vert_len)
+    ring_tpl       = _cylinder_voxels_x(ring_len, split_gap_mm=cyl_split)
+    vert_tpl       = _cylinder_voxels_x(vert_len, split_gap_mm=cyl_split)
     cap_r          = CAP_DIAMETER_MM / 2.0
     cap_sphere_tpl = _sphere_voxels(cap_r)
     collar_r       = COLLAR_DIAMETER_MM / 2.0
@@ -886,6 +978,7 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
         f"ring={ring_len:.1f}mm  strut={vert_len:.1f}mm  "
         f"cap_d={CAP_DIAMETER_MM:.1f}mm  cap_len={collar_len:.1f}mm  "
         f"collar_r={collar_r:.2f}mm"
+        + (f"  cyl_split={cyl_split:.1f}mm" if cyl_split > 0 else "")
     )
 
     sc = MM_TO_SCENE
@@ -981,7 +1074,7 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
             cnum = _cube_corner(k, z_sign) if n == 4 else cap_idx
             cap_objects.append({
                 "id": f"ca{cap_idx}",
-                "label": f"C{cnum}" if n == 4 else f"Ca {cap_idx}",
+                "label": f"c{cnum}" if n == 4 else f"ca{cap_idx}",
                 "corner": cnum if n == 4 else None,
                 "start": start,
                 "count": len(cap_raw) - start,
@@ -999,66 +1092,68 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
         corner_pos_mm = _cube_corner_positions_mm(vertices, half_h)
 
     if n == 4:
-        t  = PLATE_THICKNESS_MM
-        g  = PLATE_GAP_MM / 2.0
-        d  = SPIN_WHEEL_OFFSET_MM
         pe = PLATE_EDGE_INSET_MM
-        # Plates on outer faces; Ou/Ho clip here only (Cy/Ca/Hs unclipped; metal union uses this list).
         h  = E / 2.0 - pe
         hz = H / 2.0 - pe
         ou_r = ins
         ho_d = HOLE_DIAMETER_MM
 
-        def xfm0(u, v, w): return (u,     v,      hz - w)   # +Z top
-        def xfm1(u, v, w): return (u,     v,     -hz + w)   # -Z bottom
-        def xfm2(u, v, w): return (h - w, u,      v     )   # +X right
-        def xfm3(u, v, w): return (-h+ w, u,      v     )   # -X left
-        def xfm4(u, v, w): return (u,     h - w,  v     )   # +Y front
-        def xfm5(u, v, w): return (u,    -h + w,  v     )   # -Y back
+        if FEA_FACE_PLATES_ENABLED:
+            t  = PLATE_THICKNESS_MM
+            g  = PLATE_GAP_MM / 2.0
+            d  = SPIN_WHEEL_OFFSET_MM
+            # Plates on outer faces; Ou/Ho clip here only (Cy/Ca/Hs unclipped).
 
-        face_defs = [
-            (0, h,  h,  xfm0),
-            (1, h,  h,  xfm1),
-            (2, hz, h,  xfm2),
-            (3, hz, h,  xfm3),
-            (4, h,  hz, xfm4),
-            (5, h,  hz, xfm5),
-        ]
+            def xfm0(u, v, w): return (u,     v,      hz - w)   # +Z top
+            def xfm1(u, v, w): return (u,     v,     -hz + w)   # -Z bottom
+            def xfm2(u, v, w): return (h - w, u,      v     )   # +X right
+            def xfm3(u, v, w): return (-h+ w, u,      v     )   # -X left
+            def xfm4(u, v, w): return (u,     h - w,  v     )   # +Y front
+            def xfm5(u, v, w): return (u,    -h + w,  v     )   # -Y back
 
-        quads = {
-            'A': lambda hu, hv: (-hu,   d-g,   d+g,  hv),
-            'B': lambda hu, hv: ( d+g,  hu,   -d+g,  hv),
-            'C': lambda hu, hv: (-d+g,  hu,   -hv,  -d-g),
-            'D': lambda hu, hv: (-hu,  -d-g,  -hv,   d-g),
-        }
+            face_defs = [
+                (0, h,  h,  xfm0),
+                (1, h,  h,  xfm1),
+                (2, hz, h,  xfm2),
+                (3, hz, h,  xfm3),
+                (4, h,  hz, xfm4),
+                (5, h,  hz, xfm5),
+            ]
 
-        for (fi, hu, hv, xfm) in face_defs:
-            for qname, qbox_fn in quads.items():
-                u_lo, u_hi, v_lo, v_hi = qbox_fn(hu, hv)
-                if u_lo >= u_hi or v_lo >= v_hi:
-                    continue
-                start = len(plate_raw)
-                for (u, v, w) in _box_voxels(u_lo, u_hi, v_lo, v_hi, t):
-                    x, y, z = xfm(u, v, w)
-                    if _keep_plate_voxel(x, y, z, E, H, ou_r, ho_d):
-                        plate_raw.append((x, y, z))
-                count = len(plate_raw) - start
-                if count > 0:
-                    face_str = _CUBE_FACE_CLOCKWISE[fi]
-                    face_ids = [int(c) for c in face_str]
-                    uc = (u_lo + u_hi) / 2.0
-                    vc = (v_lo + v_hi) / 2.0
-                    wc = t / 2.0
-                    xc, yc, zc = xfm(uc, vc, wc)
-                    anchor = _closest_corner(face_ids, corner_pos_mm, xc, yc, zc)
-                    plate_objects.append({
-                        "id": f"pl{fi}{qname}",
-                        "label": f"F{face_str}",
-                        "face": face_str,
-                        "anchor_corner": anchor,
-                        "start": start,
-                        "count": count,
-                    })
+            quads = {
+                'A': lambda hu, hv: (-hu,   d-g,   d+g,  hv),
+                'B': lambda hu, hv: ( d+g,  hu,   -d+g,  hv),
+                'C': lambda hu, hv: (-d+g,  hu,   -hv,  -d-g),
+                'D': lambda hu, hv: (-hu,  -d-g,  -hv,   d-g),
+            }
+
+            for (fi, hu, hv, xfm) in face_defs:
+                for qname, qbox_fn in quads.items():
+                    u_lo, u_hi, v_lo, v_hi = qbox_fn(hu, hv)
+                    if u_lo >= u_hi or v_lo >= v_hi:
+                        continue
+                    start = len(plate_raw)
+                    for (u, v, w) in _box_voxels(u_lo, u_hi, v_lo, v_hi, t):
+                        x, y, z = xfm(u, v, w)
+                        if _keep_plate_voxel(x, y, z, E, H, ou_r, ho_d):
+                            plate_raw.append((x, y, z))
+                    count = len(plate_raw) - start
+                    if count > 0:
+                        face_str = _CUBE_FACE_CLOCKWISE[fi]
+                        face_ids = [int(c) for c in face_str]
+                        uc = (u_lo + u_hi) / 2.0
+                        vc = (v_lo + v_hi) / 2.0
+                        wc = t / 2.0
+                        xc, yc, zc = xfm(uc, vc, wc)
+                        anchor = _closest_corner(face_ids, corner_pos_mm, xc, yc, zc)
+                        plate_objects.append({
+                            "id": f"pl{fi}{qname}",
+                            "label": f"f{face_str}",
+                            "face": face_str,
+                            "anchor_corner": anchor,
+                            "start": start,
+                            "count": count,
+                        })
 
         # Hs: coaxial pipes + back washer at each face hole (axis ⊥ face)
         hs_raw:     list = []
@@ -1073,7 +1168,7 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
             ("y", -h),
         ]
         for fi, (axis, face_c) in enumerate(hs_faces):
-            label = _cube_face_label(fi)
+            face_key = _cube_face_label(fi)
             start = len(hs_raw)
             hs_raw.extend(_build_hs_face_voxels(
                 axis, face_c,
@@ -1085,7 +1180,7 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
             if count > 0:
                 hs_objects.append({
                     "id": f"hs{fi}",
-                    "label": label,
+                    "label": face_key,
                     "face": _CUBE_FACE_CLOCKWISE[fi],
                     "start": start,
                     "count": count,
@@ -1113,8 +1208,7 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
             coil_grid_voxels.extend(_build_cu_face_voxels(
                 axis, face_c, weight, HS_LENGTH_MM, CU_PIPE_EXTENSION_MM,
             ))
-            coil_key = f"f{face_str.lower()}"
-            flbl = _cube_face_label(fi)
+            face_key = _cube_face_label(fi)
             start = len(cu_pos)
             for (x, y, z, tx, ty, tz, a) in _build_cu_face_field(
                 axis, face_c, weight,
@@ -1128,9 +1222,9 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
             if count > 0:
                 cu_objects.append({
                     "id": f"cu{fi}",
-                    "label": f"{flbl} I={weight:+.2f}",
+                    "label": face_key,
                     "face": face_str,
-                    "coil_key": coil_key,
+                    "coil_key": face_key,
                     "coil_weight": round(weight, 4),
                     "start": start,
                     "count": count,
@@ -1161,6 +1255,16 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
 
     fea_grid = None
     if n == 4:
+        global _last_fea_inputs
+        _last_fea_inputs = {
+            "cyl_raw": cyl_raw,
+            "cap_raw": cap_raw,
+            "plate_raw": plate_raw,
+            "hs_raw": hs_raw,
+            "coil_voxels": coil_grid_voxels,
+            "outer_edge_mm": E,
+            "outer_height_mm": H,
+        }
         fea_grid = build_fea_grid(
             cyl_raw, cap_raw, plate_raw, hs_raw,
             coil_voxels=coil_grid_voxels,
@@ -1181,6 +1285,18 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
             f"(grid samples {len(coil_grid_voxels):,})  "
             f"raw_struct={mg['sources']['raw_total']:,}  skipped_oob={cells['skipped_oob']:,}"
         )
+        if FEA_SOLVE_ENABLED:
+            t0 = time.perf_counter()
+            bfield = solve_magnetostatic(fea_grid)
+            fea_grid["B_field"] = {
+                "max_T": bfield["meta"]["max_B_T"],
+                "mean_T": bfield["meta"]["mean_B_T"],
+                "solve_meta": bfield["meta"],
+            }
+            print(
+                f"[fea] B solve {time.perf_counter() - t0:.2f}s  "
+                f"max|B|={bfield['meta']['max_B_T']:.6e} T"
+            )
 
     total = len(cyl_raw) + len(cap_raw) + len(plate_raw) + len(hs_raw)
     print(
@@ -1190,58 +1306,44 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
         f"Cv sites: {len(cv_pos):,}"
     )
 
-    # ── Convert mm -> scene units ─────────────────────────────────────────────
     sc = MM_TO_SCENE
-
-    def to_scene(raw):
-        return [[round(x * sc, 3), round(y * sc, 3), round(z * sc, 3)]
-                for (x, y, z) in raw]
 
     scene = {
         "type":       "voxel_scene",
+        "scene_id":   "frame",
         "voxel_size": round(VOXEL_SIZE_MM * sc, 4),
-        "frame_config": {
-            "edge_mm":          E,
-            "height_mm":        H,
-            "ou_rounding_mm":   ins,
-            "ou_color":         list(OU_COLOR),
-            "hole_diameter_mm": HOLE_DIAMETER_MM,
-            "ho_color":         list(HO_COLOR),
-            "mm_to_scene":      sc,
-            "coil_weights": export_coil_table(),
-            **(
-                {
-                    "cube_corners": {
-                        str(c): _scene_point(x, y, z, sc)
-                        for c, (x, y, z) in corner_pos_mm.items()
-                    },
-                }
-                if corner_pos_mm
-                else {}
-            ),
-        },
+        "frame_config": frame_config_dict(
+            edge_mm=E,
+            height_mm=H,
+            inset_mm=ins,
+            corner_pos_mm=corner_pos_mm,
+            coil_weights=export_coil_table(),
+            sc=sc,
+            hole_diameter_mm=HOLE_DIAMETER_MM,
+            ho_color=HO_COLOR,
+        ),
         "cylinders": {
             "color":     list(CYLINDER_COLOR),
             "objects":   cyl_objects,
-            "positions": to_scene(cyl_raw),
+            "positions": to_scene_mm(cyl_raw, sc),
         },
         "caps": {
             "color":     list(CAP_COLOR),
             "objects":   cap_objects,
-            "positions": to_scene(cap_raw),
+            "positions": to_scene_mm(cap_raw, sc),
         },
     }
     if plate_raw:
         scene["plates"] = {
             "color":     list(PLATE_COLOR),
             "objects":   plate_objects,
-            "positions": to_scene(plate_raw),
+            "positions": to_scene_mm(plate_raw, sc),
         }
     if hs_raw:
         scene["hs"] = {
             "color":     list(HS_COLOR),
             "objects":   hs_objects,
-            "positions": to_scene(hs_raw),
+            "positions": to_scene_mm(hs_raw, sc),
         }
     if cu_pos or cv_pos:
         scene["coil"] = {
@@ -1260,7 +1362,7 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
             "color_positive":   list(COIL_ARROW_COLOR_POSITIVE),
             "color_negative":   list(COIL_ARROW_COLOR_NEGATIVE),
             "sites": {
-                "positions":   to_scene(cu_pos),
+                "positions":   to_scene_mm(cu_pos, sc),
                 "directions":  [[round(a, 4), round(b, 4), round(c, 4)]
                                  for (a, b, c) in cu_dir],
                 "amplitudes":  [round(a, 4) for a in cu_amp],
@@ -1272,43 +1374,16 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
             "color_positive": list(COIL_ARROW_COLOR_POSITIVE),
             "color_negative": list(COIL_ARROW_COLOR_NEGATIVE),
             "sites": {
-                "positions":   to_scene(cv_pos),
+                "positions":   to_scene_mm(cv_pos, sc),
                 "directions":  [[round(a, 4), round(b, 4), round(c, 4)]
                                  for (a, b, c) in cv_dir],
                 "amplitudes":  [round(a, 4) for a in cv_amp],
             },
         }
 
-    if fea_grid and (
-        fea_grid["metal"]["cell_count"] > 0 or fea_grid["cells"]["coil_count"] > 0
-    ):
-        mg = fea_grid["metal"]
-        coil_cells = fea_grid["cells"]["coil"]
-        scene["fea_grid"] = {
-            "origin_mm":    fea_grid["origin_mm"],
-            "spacing_mm":   fea_grid["spacing_mm"],
-            "size":         fea_grid["size"],
-            "color":        list(FEA_GRID_DEBUG_COLOR),
-            "metal": {
-                "material_id": mg["material_id"],
-                "mu_r":          mg["mu_r"],
-                "cell_count":    mg["cell_count"],
-                "positions":     to_scene(mg["positions_mm"]),
-                "sources":       mg["sources"],
-            },
-            "cells": {
-                "steel_count": fea_grid["cells"]["steel_count"],
-                "coil_count":  fea_grid["cells"]["coil_count"],
-                "steel":       fea_grid["cells"]["steel"],
-                "coil": {
-                    "material_id": coil_cells["material_id"],
-                    "mu_r":          coil_cells["mu_r"],
-                    "positions":     to_scene(coil_cells["positions_mm"]),
-                    "J":             coil_cells["J_mm"],
-                    "weight":        coil_cells["weight"],
-                },
-            },
-        }
+    grid_payload = fea_grid_payload(fea_grid, sc) if fea_grid else None
+    if grid_payload:
+        scene["fea_grid"] = grid_payload
 
     scene_json = json.dumps(scene, separators=(',', ':'))
     n_cyl = len(cyl_raw)
@@ -1326,3 +1401,9 @@ def build_voxel_scene(force=False, fea_strength_scale=1.0):
     if fea_strength_scale == 1.0:
         _scene_cache = scene
     return scene
+
+
+def build_voxel_scene(force=False, fea_strength_scale=1.0):
+    """Build the active experiment scene (see scene_registry / fea_config.FEA_SCENE_ID)."""
+    from scene_registry import build_scene
+    return build_scene(force=force, fea_strength_scale=fea_strength_scale)
