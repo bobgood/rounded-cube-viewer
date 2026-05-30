@@ -238,6 +238,7 @@ scene.add(gmMesh);
 
 // ─── Unified modes (one dropdown: experiments + spinning cubes) ───────────────
 const MODE_OPTIONS = [
+  { id: "cylinder:ngmesh",    view: "cylinder",       scene: "ngmesh",    label: "NGSolve mesh (rod + coil)" },
   { id: "cylinder:frame",     view: "cylinder",       scene: "frame",     label: "30 coils experiment" },
   { id: "cylinder:dipole",    view: "cylinder",       scene: "dipole",    label: "Dipole (e12 rod + coil)" },
   { id: "cylinder:12dipoles", view: "cylinder",       scene: "12dipoles", label: "12 dipoles (all edges)" },
@@ -636,6 +637,7 @@ function applyView() {
   }
   updateCmVisibility();
   applyBlineVisibility();
+  applyGridOpacity();
   applyOuOpacityFromSlider();
 
   const isSpin = _currentView === "spinning_cubes";
@@ -646,6 +648,7 @@ function applyView() {
 
 // ─── Apply voxel scene from Python ────────────────────────────────────────────
 function applyVoxelScene(data) {
+  clearNgMesh();
   _hasVoxelScene = true;
   const vs = data.voxel_size;
   _sceneVoxelSize = vs;
@@ -854,6 +857,117 @@ function applyBlineVisibility() {
   _blineGroup.traverse(o => { if (o.material) o.material.opacity = op; });
 }
 
+// ─── NGSolve / Netgen surface mesh (fea_mesh payload) ──────────────────────────
+let _ngMeshGroup = null;
+
+function clearNgMesh() {
+  if (!_ngMeshGroup) return;
+  scene.remove(_ngMeshGroup);
+  _ngMeshGroup.traverse(o => {
+    if (o.geometry) o.geometry.dispose();
+    if (o.material) o.material.dispose();
+  });
+  _ngMeshGroup = null;
+}
+
+function applyFeaMesh(data) {
+  clearNgMesh();
+  // Switching to the mesh scene: clear voxel + arrow state so only the mesh shows.
+  _posCache.cyl = _posCache.cap = _posCache.pl = _posCache.hs = _posCache.gm = null;
+  refreshVoxelMeshes();
+  clearCuArrows();
+  clearCvArrows();
+  clearCmField();
+  clearBlines();
+
+  const verts = data.vertices ?? [];
+  _ngMeshGroup = new THREE.Group();
+
+  if (verts.length) {
+    const flat = new Float32Array(verts.length * 3);
+    for (let i = 0; i < verts.length; i++) {
+      flat[i * 3] = verts[i][0];
+      flat[i * 3 + 1] = verts[i][1];
+      flat[i * 3 + 2] = verts[i][2];
+    }
+    const posAttr = new THREE.BufferAttribute(flat, 3);
+
+    for (const region of data.regions ?? []) {
+      const tris = region.triangles ?? [];
+      if (!tris.length) continue;
+      const idx = new Uint32Array(tris.length * 3);
+      for (let i = 0; i < tris.length; i++) {
+        idx[i * 3] = tris[i][0];
+        idx[i * 3 + 1] = tris[i][1];
+        idx[i * 3 + 2] = tris[i][2];
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", posAttr);
+      geo.setIndex(new THREE.BufferAttribute(idx, 1));
+      geo.computeVertexNormals();
+
+      const [r, g, b] = region.color ?? [0.8, 0.82, 0.85];
+      const col = new THREE.Color(r, g, b);
+      const solidOp = region.solid_opacity ?? 0.18;
+      const wireOp = region.wire_opacity ?? 0.75;
+
+      const solidMat = new THREE.MeshStandardMaterial({
+        color: col, metalness: 0.2, roughness: 0.7,
+        transparent: true, opacity: solidOp,
+        side: THREE.DoubleSide, depthWrite: false,
+      });
+      solidMat.userData.baseOpacity = solidOp;
+      const wireMat = new THREE.LineBasicMaterial({
+        color: col, transparent: true, opacity: wireOp, depthWrite: false,
+      });
+      wireMat.userData.baseOpacity = wireOp;
+      _ngMeshGroup.add(new THREE.Mesh(geo, solidMat));
+      _ngMeshGroup.add(new THREE.LineSegments(new THREE.WireframeGeometry(geo), wireMat));
+    }
+  }
+  scene.add(_ngMeshGroup);
+
+  // Mesh defaults to visible: nudge the (shared) grid slider up if it's at zero.
+  const gridSl = document.getElementById("metal-opacity-slider");
+  if (gridSl && parseFloat(gridSl.value) < 0.001) {
+    gridSl.value = "1";
+    _metalOpacity = 1.0;
+    const gv = document.getElementById("metal-opacity-val");
+    if (gv) gv.textContent = "1.00";
+  }
+
+  _hasVoxelScene = true;            // prevent applyMode from re-requesting the scene
+  _activeScene = data.scene_id ?? "ngmesh";
+  _cubeCorners = data.frame_config?.cube_corners ?? null;
+  if (data.frame_config) buildOuOutline(data.frame_config);
+  syncModeSelectFromState();
+  applyView();
+  scheduleResize();
+
+  const meta = data.meta ?? {};
+  const status = document.getElementById("solve-status");
+  if (status && _currentView === "cylinder") {
+    if (meta.error) {
+      status.textContent = `Mesh error: ${meta.error}`;
+      status.style.color = "#f85149";
+    } else {
+      status.textContent =
+        `${(meta.n_tris ?? 0).toLocaleString()} tris · ${(meta.n_points ?? 0).toLocaleString()} pts · maxh ${meta.maxh_mm}mm`;
+      status.style.color = "#3fb950";
+    }
+  }
+}
+
+function applyGridOpacity() {
+  if (!_ngMeshGroup) return;
+  const g = _metalOpacity;
+  _ngMeshGroup.visible = _currentView === "cylinder" && g > 0.001;
+  _ngMeshGroup.traverse(o => {
+    const base = o.material?.userData?.baseOpacity;
+    if (base != null) o.material.opacity = base * g;
+  });
+}
+
 // ─── WebSocket client ──────────────────────────────────────────────────────────
 let _ws = null;
 
@@ -863,29 +977,42 @@ function _blineMu() {
   return Math.max(1, Math.round(Math.pow(_BLINE_MU_MAX, t)));  // log: t=0 -> 1, t=1 -> 5000
 }
 
+// Strength slider is logarithmic: t in [0,1] maps to a current scale in
+// [_STRENGTH_MIN, _STRENGTH_MAX], with the centre (t=0.5) landing on 1.0x.
+const _STRENGTH_MIN = 0.1, _STRENGTH_MAX = 10;
+function _strength() {
+  const t = parseFloat(document.getElementById("strength-slider")?.value ?? 0.5);
+  return _STRENGTH_MIN * Math.pow(_STRENGTH_MAX / _STRENGTH_MIN, t);
+}
+function _fmtStrength(s) { return s >= 1 ? s.toFixed(2) : s.toFixed(3); }
+
 function sendSolveBfield() {
   if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
-  const strength = parseFloat(document.getElementById("strength-slider")?.value ?? 0.4);
+  const strength = _strength();
   const mu_r = _blineMu();
+  const saturate = document.getElementById("sat-checkbox")?.checked ?? true;
   const btn = document.getElementById("solve-btn");
   if (btn) btn.disabled = true;
   const status = document.getElementById("solve-status");
-  if (status) { status.textContent = `Solving B field (μ=${mu_r})…`; status.style.color = "#d29922"; }
-  _ws.send(JSON.stringify({ type: "solve_bfield", strength, mu_r }));
+  if (status) {
+    status.textContent = `Solving B field (μ=${mu_r}, ${strength.toFixed(2)}×${saturate ? ", sat" : ""})…`;
+    status.style.color = "#d29922";
+  }
+  _ws.send(JSON.stringify({ type: "solve_bfield", strength, mu_r, saturate }));
 }
 
 function sendUIState() {
   if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
   const spin     = parseFloat(document.getElementById("spin-slider")?.value     ?? 0.8);
   const damping  = parseFloat(document.getElementById("damp-slider")?.value     ?? 0.985);
-  const strength = parseFloat(document.getElementById("strength-slider")?.value ?? 0.4);
+  const strength = _strength();
   _ws.send(JSON.stringify({ type: "ui_state", spin, damping, strength }));
   if (_feaRunning) refreshCoilArrows(_sceneVoxelSize);
 }
 
 function sendFeaStart() {
   if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
-  const strength = parseFloat(document.getElementById("strength-slider")?.value ?? 0.4);
+  const strength = _strength();
   _feaRunning = true;
   _ws.send(JSON.stringify({ type: "fea_start", strength }));
 }
@@ -986,6 +1113,7 @@ function connectWS() {
   _ws.addEventListener("message", e => {
     const data = JSON.parse(e.data);
     if      (data.type === "voxel_scene")   applyVoxelScene(data);
+    else if (data.type === "fea_mesh")      applyFeaMesh(data);
     else if (data.type === "scene_list") {
       updateModeOptionLabels(data.scenes ?? []);
       if (data.active) {
@@ -1123,10 +1251,19 @@ function bindSlider(id, valId, decimals, cb) {
 
 bindSlider("spin-slider",     "spin-val",     1, () => sendUIState());
 bindSlider("damp-slider",     "damp-val",     3, () => sendUIState());
-bindSlider("strength-slider", "strength-val", 2, () => {
-  sendUIState();
-  sendFeaStart();
-});
+const _strengthSlider = document.getElementById("strength-slider");
+if (_strengthSlider) {
+  const showStrength = () => {
+    const val = document.getElementById("strength-val");
+    if (val) val.textContent = _fmtStrength(_strength());
+  };
+  _strengthSlider.addEventListener("input", () => {
+    showStrength();
+    sendUIState();
+    sendFeaStart();
+  });
+  showStrength();
+}
 
 const _opSlider = document.getElementById("opacity-slider");
 const _metalOpSlider = document.getElementById("metal-opacity-slider");
@@ -1149,6 +1286,7 @@ function applyMetalOpacityFromSlider() {
   const opV = document.getElementById("metal-opacity-val");
   if (opV) opV.textContent = _metalOpacity.toFixed(2);
   gmMat.opacity = _metalOpacity;
+  applyGridOpacity();
   applyView();
 }
 

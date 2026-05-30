@@ -16,7 +16,7 @@ from cube_config import (
 )
 
 # ── Active experiment (dropdown / server message) ─────────────────────────────
-FEA_SCENE_ID = "frame"   # "frame" | "dipole"
+FEA_SCENE_ID = "ngmesh"   # "ngmesh" | "frame" | "dipole" | "12dipoles"
 
 # ── Dipole experiment (rod on one edge + single solenoid coil) ────────────────
 # All distances in mm; restart server after editing.

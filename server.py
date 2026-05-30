@@ -11,7 +11,7 @@ Messages  Browser -> Python:
   { "type": "view",      "view": "cylinder" | "spinning_cubes" }
   { "type": "scene",     "scene": "frame" | "dipole" }
   { "type": "fea_start", "strength": f }
-  { "type": "solve_bfield", "strength": f, "mu_r": f }
+  { "type": "solve_bfield", "strength": f, "mu_r": f, "saturate": bool }
 
 Install:  pip install websockets
 Run:      python -u server.py
@@ -137,13 +137,21 @@ async def handler(ws):
                 elif t == "solve_bfield":
                     scale = float(msg.get("strength", ui_state.get("strength", 1.0)))
                     mu_r = float(msg.get("mu_r", 1.0))
+                    saturate = bool(msg.get("saturate", True))
                     print(f"[fea] solve_bfield  scene={_active_scene}  "
-                          f"strength_scale={scale}  mu_r={mu_r:g}")
+                          f"strength_scale={scale}  mu_r={mu_r:g}  saturate={saturate}")
                     await ws.send(json.dumps({"type": "bfield_status", "state": "solving"}))
                     try:
-                        payload = await asyncio.to_thread(
-                            build_bfield_lines, fea_strength_scale=scale, mu_r=mu_r
-                        )
+                        if _active_scene == "ngmesh":
+                            from ngsolve_solve import solve_ng_bfield
+                            payload = await asyncio.to_thread(
+                                solve_ng_bfield, mu_r=mu_r, fea_strength_scale=scale,
+                                saturate=saturate,
+                            )
+                        else:
+                            payload = await asyncio.to_thread(
+                                build_bfield_lines, fea_strength_scale=scale, mu_r=mu_r
+                            )
                         await ws.send(json.dumps(payload, separators=(',', ':')))
                     except Exception as exc:  # noqa: BLE001
                         print(f"[fea] solve_bfield FAILED: {type(exc).__name__}: {exc}")
