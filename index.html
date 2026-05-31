@@ -363,6 +363,45 @@
             <input type="range" id="powB" min="-1" max="1" step="0.01" value="1">
             <span class="val" id="powB-val">+100%</span>
           </label>
+          <label title="Magnetic-pressure isosurface B²/2μ₀ of the SUPERPOSED two-cube field (read from the precomputed field files). Far left = off; right raises the level so the shell shrinks toward the strongest field in the gap.">
+            B field
+            <input type="range" id="motion-bsurf-slider" min="0" max="1" step="0.001" value="0">
+            <span class="val" id="motion-bsurf-val">off</span>
+          </label>
+          <label title="Force visualization (Maxwell-stress cross term). Green = net force from each cube's centre; magenta = per-corner differential arrows showing twist. Far left = off; right scales arrow length.">
+            Force
+            <input type="range" id="motion-force-slider" min="0" max="1" step="0.01" value="0">
+            <span class="val" id="motion-force-val" title="Net magnetic force on box 1 in real Newtons, next to its weight m·g.">off</span>
+          </label>
+
+          <div class="panel-title">Animation</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px;">
+            <button id="motion-play-btn" title="Play / pause the real-SI force-driven motion (Newtons, kg, drag + bounce).">▶ Play</button>
+            <button id="motion-step-btn" title="Advance one fixed time step while paused.">Step</button>
+            <button id="motion-save-btn" title="Save the current cube poses (positions + orientations) as the restore point.">Save</button>
+            <button id="motion-restore-btn" title="Stop and restore cubes to the last saved poses (velocities zeroed).">Restore</button>
+          </div>
+          <label title="Time / strength multiplier on top of REAL physics (logarithmic; centre = 1× real time). Forces (N) and gravity are real SI, so 1× is the true rate; slow down to study, speed up to fast-forward.">
+            Speed
+            <input type="range" id="motion-speed-slider" min="0" max="1" step="0.01" value="0.5">
+            <span class="val" id="motion-speed-val">1.0×</span>
+          </label>
+          <label title="Drag (air/eddy-current damping). Left = frictionless; right = motion bleeds off quickly. Damps both translation and spin.">
+            Drag
+            <input type="range" id="motion-drag-slider" min="0" max="1" step="0.01" value="0.25">
+            <span class="val" id="motion-drag-val">—</span>
+          </label>
+          <label title="Bounce (restitution) when cubes collide or hit the world boundary. 0% = stick (no rebound); 100% = perfectly elastic.">
+            Bounce
+            <input type="range" id="motion-bounce-slider" min="0" max="1" step="0.01" value="0.4">
+            <span class="val" id="motion-bounce-val">—</span>
+          </label>
+          <label title="Gravity (log scale). Far left = OFF and the floor disappears. Right increases downward gravity; 1.0 g = Earth. A frictionless floor appears and bounces (Bounce slider) whenever gravity is on.">
+            Gravity
+            <input type="range" id="motion-grav-slider" min="0" max="1" step="0.01" value="0">
+            <span class="val" id="motion-grav-val">off</span>
+          </label>
+          <div id="motion-power" style="font-size:11px;color:#8b949e;margin-top:4px;" title="Live ohmic power draw of both cubes' coils at the current drive levels (real Watts from the solver; scales with current²).">power: —</div>
           <div id="motion-status" style="font-size:11px;color:#8b949e;margin-top:6px;">
             Yellow arrows = magnetic north per energised edge. Drag to orbit.
             Double-click a cube to grab it (tints orange): drag = rotate it,

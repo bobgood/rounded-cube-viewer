@@ -12,6 +12,8 @@ slider, coloured by polarity), and a steel/coil/air mesh overlay (mesh slider).
 
 from __future__ import annotations
 
+import math
+
 from cube_config import FRAME_EDGE_MM
 import ng_config
 from ng_config import (
@@ -48,6 +50,40 @@ def build_specs() -> list:
         coil_length_mm=NG12_COIL_LENGTH_MM,
         half=NG_CUBE_HALF_MM,
     )
+
+
+def power_by_config() -> dict:
+    """Ohmic power (W) at 1x drive for every named config — no meshing, just the
+    coil-current summary on the per-config edge weights. Power scales ~current²,
+    so the client multiplies by (drive level)²."""
+    out = {}
+    for name, cfg in ng_config.NG12_CONFIGS.items():
+        currents = {e: 0.0 for e in ng_config.NG12_EDGES}
+        currents.update(cfg)
+        specs = ng_dipoles.edge_dipole_specs(
+            currents,
+            rod_radius_mm=NG12_ROD_RADIUS_MM,
+            coil_clearance_mm=NG12_COIL_CLEARANCE_MM,
+            coil_thickness_mm=NG12_COIL_THICKNESS_MM,
+            rod_length_mm=NG12_ROD_LENGTH_MM,
+            coil_length_mm=NG12_COIL_LENGTH_MM,
+            half=NG_CUBE_HALF_MM,
+        )
+        params = ng_dipoles.specs_to_params(specs, 1.0)
+        out[name] = float(ng_dipoles.coil_drive_summary(params)["total_power_W"])
+    return out
+
+
+def cube_mass() -> dict:
+    """Steel + copper mass (grams) of ONE cube module. Config-independent: all 12
+    edges always carry a rod + coil (drive only changes which are energised), so
+    the mass is the same for every config. Uses exact analytic cylinder volumes."""
+    n = len(ng_config.NG12_EDGES)                       # 12 edges
+    coil_inner = NG12_ROD_RADIUS_MM + NG12_COIL_CLEARANCE_MM
+    coil_outer = coil_inner + NG12_COIL_THICKNESS_MM
+    steel_vol = n * math.pi * NG12_ROD_RADIUS_MM ** 2 * NG12_ROD_LENGTH_MM
+    copper_vol = n * math.pi * (coil_outer ** 2 - coil_inner ** 2) * NG12_COIL_LENGTH_MM
+    return ng_dipoles.mass_summary(steel_vol, copper_vol)
 
 
 def coil_update() -> dict:

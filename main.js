@@ -2,7 +2,11 @@ import * as THREE from "three";
 import { OrbitControls }      from "three/examples/jsm/controls/OrbitControls.js";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
 import { extractIsosurface }  from "./marching_cubes.js";
-import { MotionStage, MOTION_OFFSET, levelToDrive } from "./motion.js";
+import { MotionStage, MOTION_OFFSET, levelToDrive, HALF as MOTION_CUBE_HALF } from "./motion.js";
+import { FieldStore } from "./fieldData.js";
+import { buildBMagGrid, computeForces } from "./motionPhysics.js";
+import { CONFIG } from "./config.js";
+import { obbContact } from "./obbCollision.js";
 
 // ─── Scene / camera / renderer ────────────────────────────────────────────────
 const container = document.getElementById("app");
@@ -703,6 +707,47 @@ function applyGridOpacity() {
 // ─── WebSocket client ──────────────────────────────────────────────────────────
 let _ws = null;
 
+// ─── Motion-view field store (per-config vector B grids from the server) ──────
+const _fieldStore = new FieldStore();
+const _fieldPending = new Set();
+let _motionPowerW = {};         // config → ohmic Watts at 1× drive (from server)
+let _motionMassG = 0;           // one cube's mass (grams, config-independent)
+let _motionMetaRequested = false;
+
+function requestMotionMeta() {
+  if (_motionMetaRequested) return;
+  if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
+  _motionMetaRequested = true;
+  _ws.send(JSON.stringify({ type: "motion_meta" }));
+}
+
+function ensureField(cfg) {
+  if (!cfg || _fieldStore.has(cfg) || _fieldPending.has(cfg)) return;
+  if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
+  _fieldPending.add(cfg);
+  _ws.send(JSON.stringify({ type: "load_field", config: cfg }));
+}
+
+// Binary frame layout: [u32 headerLen][JSON header][Bx f32][By f32][Bz f32].
+function handleFieldBinary(buf) {
+  const dv = new DataView(buf);
+  const hlen = dv.getUint32(0, true);
+  const hdr = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, hlen)));
+  const n = hdr.size[0];
+  const count = hdr.size[0] * hdr.size[1] * hdr.size[2];
+  let off = 4 + hlen;
+  // .slice() copies into a fresh, 4-byte-aligned buffer (headerLen is arbitrary).
+  const bx = new Float32Array(buf.slice(off, off + count * 4)); off += count * 4;
+  const by = new Float32Array(buf.slice(off, off + count * 4)); off += count * 4;
+  const bz = new Float32Array(buf.slice(off, off + count * 4));
+  _fieldStore.set(hdr.config, {
+    n, originMm: hdr.origin_mm, spacingMm: hdr.spacing_mm, bMax: hdr.max_B_T, bx, by, bz,
+  });
+  _fieldPending.delete(hdr.config);
+  console.info(`[field] loaded ${hdr.config}  max|B|=${hdr.max_B_T.toExponential(2)} T`);
+  scheduleMotionField();
+}
+
 const _BLINE_MU_MAX = 5000;
 function _blineMu() {
   const t = parseFloat(document.getElementById("bline-mu-slider")?.value ?? 0);
@@ -794,13 +839,17 @@ function motionStatesFromUI() {
   ];
 }
 
-// Power readout: signed percentage of full power (− = reversed polarity).
+// Power readout: signed percentage of full power (− = reversed polarity), plus
+// the real ohmic Watts for this box's config at the chosen drive (P ∝ current²).
 function updateMotionPowReadout(suffix) {
   const el = document.getElementById(`pow${suffix}-val`);
   if (!el) return;
   const d = levelToDrive(parseFloat(document.getElementById(`pow${suffix}`)?.value ?? "1"));
   const pct = Math.round(d.powerPct);
-  el.textContent = `${d.polarity < 0 ? "\u2212" : "+"}${pct}%`;
+  const cfg = document.getElementById(`cfg${suffix}`)?.value ?? "face";
+  const base = _motionPowerW[cfg];
+  const watts = (base != null) ? `  ${_fmtW(base * d.currentScale * d.currentScale)}` : "";
+  el.textContent = `${d.polarity < 0 ? "\u2212" : "+"}${pct}%${watts}`;
 }
 
 function refreshMotion() {
@@ -815,11 +864,17 @@ function refreshMotion() {
     _selectedIdx = -1;
   }
   updateMotionSelReadout();
+  // Prefetch each body's field + per-config power and refresh the B/force viz.
+  requestMotionMeta();
+  for (const d of _motion.bodyDescriptors()) ensureField(d.config);
+  scheduleMotionField();
+  updateMotionPowerReadout();
 }
 
 function enterMotionView() {
   _currentView = "motion";
   refreshMotion();
+  updateMotionFloor();
   document.getElementById("controls")?.classList.add("view-motion");
   applyView();
   syncModeSelectFromState();
@@ -869,10 +924,13 @@ function applyMode(modeId) {
   }
 
   const prevScene = _activeScene;
+  setMotionPlaying(false);   // leaving motion view: stop the sim
   _currentView = "cylinder";
   selectMotionBody(-1);   // leaving motion view: drop any debug selection
+  clearMotionField();     // and tear down the B/force visualization
   document.getElementById("controls")?.classList.remove("view-motion");
   if (_motion) _motion.setVisible(false);
+  if (_motionFloor) _motionFloor.visible = false;
 
   const sceneId = mode.scene ?? "1dipole";
   const sceneChanged = sceneId !== prevScene;
@@ -894,13 +952,22 @@ function applyMode(modeId) {
 
 function connectWS() {
   _ws = new WebSocket("ws://localhost:8765");
+  _ws.binaryType = "arraybuffer";
   _ws.addEventListener("open", () => {
     sendUIState();
     applyMode(document.getElementById("mode-select")?.value ?? currentModeId());
   });
   _ws.addEventListener("message", e => {
+    if (e.data instanceof ArrayBuffer) { handleFieldBinary(e.data); return; }
     const data = JSON.parse(e.data);
-    if      (data.type === "fea_mesh")     applyFeaMesh(data);
+    if      (data.type === "field_error")  console.warn(`[field] ${data.config}: ${data.error}`);
+    else if (data.type === "motion_meta")  {
+      _motionPowerW = data.power_W ?? {};
+      _motionMassG  = data.mass_g?.total_mass_g ?? _motionMassG;
+      updateMotionPowReadout("A"); updateMotionPowReadout("B");
+      updateMotionPowerReadout();
+    }
+    else if (data.type === "fea_mesh")     applyFeaMesh(data);
     else if (data.type === "coil_update")  applyCoilUpdate(data);
     else if (data.type === "scene_list") {
       updateModeOptionLabels(data.scenes ?? []);
@@ -1066,6 +1133,8 @@ function selectMotionBody(idx) {
   _selectedIdx = (idx != null && idx >= 0) ? idx : -1;
   const picked = _selectedBody();
   if (picked) {
+    setMotionPlaying(false);         // grabbing a cube pauses the sim
+    if (_anim.state[_selectedIdx]) { _anim.state[_selectedIdx].vel.set(0, 0, 0); _anim.state[_selectedIdx].ang.set(0, 0, 0); }
     _motion.highlight(picked, true);
     controls.enableRotate = false;   // orbit rotate/pan now drive the body
     controls.enablePan    = false;
@@ -1098,6 +1167,7 @@ function _rotateSelected(dx, dy) {
   b.quaternion.premultiply(_dragQuat);
   _motion.markMoved(_selectedIdx);
   updateMotionSelReadout();
+  scheduleMotionField();
 }
 
 function _panSelected(dx, dy) {
@@ -1112,6 +1182,7 @@ function _panSelected(dx, dy) {
   b.position.addScaledVector(_camUp,    -dy * wpp);
   _motion.markMoved(_selectedIdx);
   updateMotionSelReadout();
+  scheduleMotionField();
 }
 
 renderer.domElement.addEventListener("dblclick", e => {
@@ -1143,6 +1214,638 @@ window.addEventListener("mouseup", () => { _dragBtn = -1; });
 renderer.domElement.addEventListener("contextmenu", e => {
   if (_currentView === "motion" && _selectedBody()) e.preventDefault();
 });
+
+// ─── Motion-view field & force visualization ──────────────────────────────────
+// Superpose the two cubes' precomputed B fields, draw a magnetic-pressure
+// isosurface (B field slider), and read net force + per-corner twist arrows off
+// the field via the Maxwell-stress cross term (Force slider). Read-only — no
+// motion/integration; this is a debugging + intuition tool.
+const MOTION_GRID_HALF = 6.0;   // world cube half-extent for the |B| lattice
+const MOTION_GRID_N     = 48;   // lattice resolution per axis
+const MOTION_FORCE_FACEG = 6;   // stress samples per box-face edge
+const _FORCE_COL_NET  = 0x39d353;   // green  — net force
+const _FORCE_COL_DIFF = 0xff5db1;   // magenta — per-corner twist
+
+let _motionBGrid   = null;   // cached { values, n, origin, step, bMax }
+let _motionForces  = null;   // cached per-body force result
+let _motionBsurfMesh  = null;
+let _motionForceGroup = null;
+let _motionFieldRaf   = 0;
+
+function clearMotionBsurf() {
+  if (!_motionBsurfMesh) return;
+  scene.remove(_motionBsurfMesh);
+  _motionBsurfMesh.geometry?.dispose();
+  _motionBsurfMesh.material?.dispose();
+  _motionBsurfMesh = null;
+}
+
+function clearMotionForceGroup() {
+  if (!_motionForceGroup) return;
+  scene.remove(_motionForceGroup);
+  _motionForceGroup.traverse(o => { o.geometry?.dispose?.(); o.material?.dispose?.(); });
+  _motionForceGroup = null;
+}
+
+function clearMotionField() {
+  clearMotionBsurf();
+  clearMotionForceGroup();
+  _motionBGrid = null;
+  _motionForces = null;
+}
+
+// Coalesce pose/config changes into one recompute per frame.
+function scheduleMotionField() {
+  if (_currentView !== "motion") return;
+  if (_motionFieldRaf) return;
+  _motionFieldRaf = requestAnimationFrame(() => { _motionFieldRaf = 0; recomputeMotionField(); });
+}
+
+function _motionFieldsReady(bodies) {
+  let ready = bodies.length > 0;
+  for (const b of bodies) {
+    if (!_fieldStore.has(b.config)) { ensureField(b.config); ready = false; }
+  }
+  return ready;
+}
+
+function _motionBsurfSliderOn() {
+  return parseFloat(document.getElementById("motion-bsurf-slider")?.value ?? 0) > 0.001;
+}
+
+function recomputeMotionField() {
+  if (_currentView !== "motion" || !_motion) return;
+  const bodies = _motion.bodyDescriptors();
+  // Need every body's field loaded; request missing ones and bail (we recompute
+  // when they arrive via handleFieldBinary → scheduleMotionField).
+  if (!_motionFieldsReady(bodies)) return;
+
+  _motionForces = computeForces(_fieldStore, bodies, MOTION_CUBE_HALF, 0.25, MOTION_FORCE_FACEG, SCENE_TO_M);
+  // The |B| lattice is only needed for the isosurface — skip it (it's the heavy
+  // part) when the B-field slider is off, so dragging/animation stay cheap.
+  _motionBGrid = _motionBsurfSliderOn()
+    ? buildBMagGrid(_fieldStore, bodies, MOTION_GRID_HALF, MOTION_GRID_N) : null;
+  redrawMotionBsurf();
+  redrawMotionForces();
+}
+
+function _motionBsurfLevel() {
+  if (!_motionBGrid || !(_motionBGrid.bMax > 0)) return null;
+  const t = parseFloat(document.getElementById("motion-bsurf-slider")?.value ?? 0);
+  if (t <= 0.001) return null;
+  const bMax = _motionBGrid.bMax;
+  const bMin = Math.min(Math.sqrt(2 * _MU0 * 0.1), bMax * 0.5);   // 0.1 Pa floor
+  return bMin * Math.pow(bMax / bMin, t);
+}
+
+function updateMotionBsurfReadout(level) {
+  const el = document.getElementById("motion-bsurf-val");
+  if (!el) return;
+  el.textContent = level == null ? "off" : _fmtForce((level * level) / (2 * _MU0));
+}
+
+function redrawMotionBsurf() {
+  clearMotionBsurf();
+  const level = _motionBsurfLevel();
+  updateMotionBsurfReadout(level);
+  if (level == null || !_motionBGrid) return;
+
+  const verts = extractIsosurface(
+    _motionBGrid.values, _motionBGrid.n, level, _motionBGrid.origin, _motionBGrid.step);
+  if (!verts.length) return;
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(verts, 3));
+  geo.computeVertexNormals();
+  const frac = Math.sqrt(Math.min(1, level / _motionBGrid.bMax));
+  const col = _blineColorLo.clone().lerp(_blineColorHi, frac);
+  const mat = new THREE.MeshStandardMaterial({
+    color: col, metalness: 0.0, roughness: 0.5,
+    transparent: true, opacity: 0.5, side: THREE.DoubleSide, depthWrite: false,
+  });
+  _motionBsurfMesh = new THREE.Mesh(geo, mat);
+  _motionBsurfMesh.renderOrder = 2;
+  scene.add(_motionBsurfMesh);
+}
+
+function updateMotionForceReadout() {
+  const el = document.getElementById("motion-force-val");
+  if (!el) return;
+  const t = parseFloat(document.getElementById("motion-force-slider")?.value ?? 0);
+  if (t <= 0.001 || !_motionForces?.length) { el.textContent = "off"; return; }
+  // Real Newtons now — shown next to the cube's weight m·g for a direct compare.
+  const f = _motionForces[0].force.length();           // N (net magnetic force on box 1)
+  const mg = _bodyMassKg() * 9.81;                      // N (weight)
+  const fmt = (x) => (x >= 1e-3 ? x.toPrecision(2) : x.toExponential(1));
+  el.textContent = `\u2248${fmt(f)} N  ·  mg ${fmt(mg)} N`;
+}
+
+// ArrowHelper that ignores the depth buffer so the opaque cube never hides it.
+function _makeForceArrow(dir, origin, len, color, headLen, headW) {
+  const a = new THREE.ArrowHelper(dir, origin, len, color, headLen, headW);
+  for (const part of [a.line, a.cone]) {
+    if (!part?.material) continue;
+    part.material.depthTest = false;
+    part.material.transparent = true;
+    part.renderOrder = 6;
+  }
+  return a;
+}
+
+const _faDir = new THREE.Vector3();
+
+function redrawMotionForces() {
+  clearMotionForceGroup();
+  updateMotionForceReadout();
+  const t = parseFloat(document.getElementById("motion-force-slider")?.value ?? 0);
+  if (t <= 0.001 || !_motionForces?.length) return;
+
+  // Auto-normalize by the largest net force so the slider sets a readable length.
+  let fRef = 1e-12;
+  for (const r of _motionForces) fRef = Math.max(fRef, r.force.length());
+  const lenScale = (2.5 * t) / fRef;
+
+  _motionForceGroup = new THREE.Group();
+  for (const r of _motionForces) {
+    const fl = r.force.length();
+    if (fl > 1e-12) {
+      _faDir.copy(r.force).normalize();
+      const len = Math.max(0.05, fl * lenScale);
+      // Start the net arrow just outside the face it points toward, not at the
+      // (hidden) centre of mass, so it reads as emanating from the body.
+      const origin = r.center.clone().addScaledVector(_faDir, MOTION_CUBE_HALF + 0.1);
+      _motionForceGroup.add(_makeForceArrow(
+        _faDir.clone(), origin, len, _FORCE_COL_NET, len * 0.3, len * 0.18));
+    }
+    for (let ci = 0; ci < 8; ci++) {
+      const d = r.cornerForce[ci];
+      const dl = d.length();
+      if (dl <= 1e-12) continue;
+      const len = Math.max(0.03, dl * lenScale);
+      _motionForceGroup.add(_makeForceArrow(
+        d.clone().normalize(), r.cornerPos[ci].clone(), len,
+        _FORCE_COL_DIFF, len * 0.35, len * 0.2));
+    }
+  }
+  scene.add(_motionForceGroup);
+}
+
+const _motionBsurfSlider = document.getElementById("motion-bsurf-slider");
+if (_motionBsurfSlider) {
+  _motionBsurfSlider.addEventListener("input", () => {
+    // Re-threshold the cached grid if we have it; otherwise build it once.
+    if (_motionBGrid) redrawMotionBsurf();
+    else scheduleMotionField();
+  });
+}
+const _motionForceSlider = document.getElementById("motion-force-slider");
+if (_motionForceSlider) _motionForceSlider.addEventListener("input", redrawMotionForces);
+
+// ─── Motion-view animation (force-driven rigid bodies) ────────────────────────
+// Read-only physics atop the staged cubes: each frame we read net force (N) +
+// torque (N·m) off the superposed real-Tesla field via Maxwell stress, integrate
+// real F=ma / τ=Iα (kg, m) with damping (drag) + restitution (bounce), and write
+// the poses back. The Speed slider is a pure time/strength multiplier (1× = real
+// time). Power draw is real too (server Watts × current²).
+const _anim = { playing: false, last: 0, state: [] };
+let _motionSaved = null;   // [{ pos:[x,y,z], quat:[x,y,z,w] }, ...]
+
+function updateMotionPowerReadout() {
+  const el = document.getElementById("motion-power");
+  if (!el) return;
+  if (!_motion) { el.textContent = "power: —"; return; }
+  let tot = 0, known = false;
+  for (const b of _motion.bodyDescriptors()) {
+    const p = _motionPowerW[b.config];
+    if (p != null) { known = true; tot += p * b.scale * b.scale; }   // P ∝ current²
+  }
+  const massTxt = _motionMassG > 0 ? `  \u00b7  mass: ${_motionMassG.toFixed(1)} g/box` : "";
+  el.textContent = (known ? `power: ${_fmtW(tot)}` : "power: …") + massTxt;
+}
+
+// One cube's mass in kg for F=ma (server grams; falls back to the nominal mass).
+function _bodyMassKg() {
+  return _motionMassG > 0 ? _motionMassG / 1000 : CONFIG.CUBE_MASS;
+}
+
+function _animSpeedMul() {
+  const s = parseFloat(document.getElementById("motion-speed-slider")?.value ?? 0.5);
+  return Math.pow(10, 4 * (s - 0.5));   // 0.01× … 100×, centre = 1×
+}
+function _updateSpeedReadout() {
+  const el = document.getElementById("motion-speed-val");
+  if (!el) return;
+  const m = _animSpeedMul();
+  el.textContent = m >= 1 ? `${m.toFixed(m < 10 ? 1 : 0)}\u00d7` : `${m.toFixed(2)}\u00d7`;
+}
+
+// Drag → per-step velocity multipliers (1 = frictionless). Translation damps a
+// little less than spin so cubes can still drift while rotations settle.
+function _animDamping() {
+  const t = parseFloat(document.getElementById("motion-drag-slider")?.value ?? 0.25);
+  return { lin: 1 - 0.10 * t, ang: 1 - 0.14 * t };
+}
+function _updateDragReadout() {
+  const el = document.getElementById("motion-drag-val");
+  if (!el) return;
+  const t = parseFloat(document.getElementById("motion-drag-slider")?.value ?? 0.25);
+  el.textContent = t < 0.005 ? "off" : `${(0.10 * t * 100).toFixed(1)}%/step`;
+}
+
+// Bounce → coefficient of restitution e ∈ [0,1] for collisions / wall hits.
+function _animRestitution() {
+  return parseFloat(document.getElementById("motion-bounce-slider")?.value ?? 0.4);
+}
+function _updateBounceReadout() {
+  const el = document.getElementById("motion-bounce-val");
+  if (!el) return;
+  const e = _animRestitution();
+  el.textContent = e < 0.005 ? "stick" : `${Math.round(e * 100)}%`;
+}
+
+// Finite, magnitude-capped scale for a force/torque vector (0 if non-finite).
+function _clampScale(len, cap) {
+  if (!(len <= cap)) return (len > 0 && isFinite(len)) ? cap / len : 0;
+  return 1;
+}
+
+// 1 scene unit = 0.01 m (32 mm cube = 3.2 units). Real SI everywhere: the
+// Maxwell-stress force is in Newtons, mass in kg, so a = F/m is a real m/s²,
+// converted to scene-units/s² by /SCENE_TO_M for the (scene-unit) integrator.
+const SCENE_TO_M = 0.01;
+// Safety caps are generous (well above gravity) — they only catch the unphysical
+// near-singular field at/inside contact, never the legitimate dynamics.
+const MOTION_VMAX = 200;     // hard cap on linear speed   (scene units / s ≈ 2 m/s)
+const MOTION_WMAX = 40;      // hard cap on angular speed  (rad / s)
+const MOTION_AMAX = 20000;   // cap on linear acceleration  (scene units / s² ≈ 20 g)
+const MOTION_ALPHAMAX = 4000; // cap on angular acceleration (rad / s²)
+const MOTION_MAXSUB = 96;    // max integrate→collide substeps per frame (stiffness guard)
+
+// Earth g = 9.8 m/s² = 980 scene-units/s². The slider is a log scale in
+// Earth-multiples; the floor is a frictionless plane that only exists when g > 0.
+const G_EARTH_SCENE  = 9.8 / SCENE_TO_M;
+// Gravity is full whenever the cube is at (or near) rest — enough to hold it down
+// and eventually settle it — but stops pulling once it's already creeping down at
+// this tiny speed, so it can never build up a fast, ringing fall.
+// (scene units / s ≈ 0.01 m/s; tweak to taste.)
+const MOTION_GRAV_VTERM = 1;
+// While two surfaces rest gently in contact, bleed off ROCKING (angular motion
+// perpendicular to the contact normal) so a corner/edge contact settles instead
+// of jittering — but leave TWIST (spin about the contact normal) untouched so
+// magnetic twisting against a face / on the ground is preserved. Angular-only, so
+// sliding stays frictionless.
+const MOTION_SETTLE_DAMP  = 0.7;        // per-substep decay of the rocking component
+const MOTION_SETTLE_SPEED = 2;          // …only when the contact is closing this gently
+const MOTION_FLOOR_Y = -3.0;
+let _motionFloor = null;
+
+function _animGravityG() {            // gravity in Earth-multiples, 0 = off
+  const t = parseFloat(document.getElementById("motion-grav-slider")?.value ?? 0);
+  if (t < 1e-4) return 0;
+  return Math.pow(10, -3.5 + t * 3.5);  // ≈0.0003 g … 1.0 g (Earth), log
+}
+function _updateGravReadout() {
+  const el = document.getElementById("motion-grav-val");
+  if (!el) return;
+  const g = _animGravityG();
+  el.textContent = g <= 0 ? "off" : `${g.toPrecision(2)} g`;
+}
+
+function ensureMotionFloor() {
+  if (_motionFloor) return _motionFloor;
+  const g = new THREE.Group();
+  const size = 2 * MOTION_WORLD_BOUND;
+  const grid = new THREE.GridHelper(size, 24, 0x58a6ff, 0x30363d);
+  grid.position.y = MOTION_FLOOR_Y;
+  grid.material.transparent = true;
+  grid.material.opacity = 0.6;
+  g.add(grid);
+  const plane = new THREE.Mesh(
+    new THREE.PlaneGeometry(size, size),
+    new THREE.MeshStandardMaterial({
+      color: 0x0d1117, transparent: true, opacity: 0.35,
+      side: THREE.DoubleSide, roughness: 1, metalness: 0,
+    }),
+  );
+  plane.rotation.x = -Math.PI / 2;
+  plane.position.y = MOTION_FLOOR_Y - 0.01;
+  g.add(plane);
+  g.visible = false;
+  scene.add(g);
+  _motionFloor = g;
+  return g;
+}
+function updateMotionFloor() {
+  ensureMotionFloor().visible = _currentView === "motion" && _animGravityG() > 0;
+}
+
+function _ensureAnimState() {
+  const n = _motion ? _motion.bodies.length : 0;
+  while (_anim.state.length < n) _anim.state.push({ vel: new THREE.Vector3(), ang: new THREE.Vector3() });
+  _anim.state.length = n;
+}
+function _zeroAnimState() { for (const s of _anim.state) { s.vel.set(0, 0, 0); s.ang.set(0, 0, 0); } }
+
+// If anything went non-finite (NaN/Inf), reset that body to a safe state so the
+// sim recovers instead of permanently crashing the view.
+function _guardMotionState() {
+  if (!_motion) return;
+  const ok = (v) => Number.isFinite(v);
+  for (let i = 0; i < _motion.bodies.length; i++) {
+    const b = _motion.bodies[i], st = _anim.state[i], p = b.position, q = b.quaternion;
+    if (ok(p.x) && ok(p.y) && ok(p.z) && ok(q.x) && ok(q.y) && ok(q.z) && ok(q.w)) {
+      if (st && (!ok(st.vel.x) || !ok(st.ang.x))) { st.vel.set(0, 0, 0); st.ang.set(0, 0, 0); }
+      continue;
+    }
+    if (st) { st.vel.set(0, 0, 0); st.ang.set(0, 0, 0); }
+    const o = i === 0 ? -MOTION_OFFSET : MOTION_OFFSET;
+    p.set(o, 0, 0);
+    q.set(0, 0, 0, 1);
+    _motion.markMoved(i);
+  }
+}
+
+const _cN = new THREE.Vector3();
+const MOTION_WORLD_BOUND = CONFIG.WORLD_BOUND;   // cubes bounce back inside this radius
+
+const _rA = new THREE.Vector3();
+const _rB = new THREE.Vector3();
+const _vrel = new THREE.Vector3();
+const _xprod = new THREE.Vector3();
+const _Jv = new THREE.Vector3();
+const _acc = new THREE.Vector3();
+const _alpha = new THREE.Vector3();
+const _floorMat = new THREE.Matrix4();
+const _contact = { n: new THREE.Vector3(), depth: 0, point: new THREE.Vector3() };
+
+// Cube ↔ horizontal floor (normal +Y). The contact point is the *centroid of the
+// contact manifold* (all vertices at the lowest height): directly under the COM
+// for a flat rest → no spurious torque (no jitter), but at the corner/edge for a
+// tilted landing → it tips. Normal restitution + tempered spin; tangential
+// velocity is left untouched (frictionless, as requested).
+function _resolveFloor(i, e, invM, invI) {
+  const b = _motion.bodies[i], st = _anim.state[i];
+  const h = MOTION_CUBE_HALF;
+  _floorMat.makeRotationFromQuaternion(b.quaternion);
+  const m = _floorMat.elements;
+  const px = b.position.x, py = b.position.y, pz = b.position.z;
+  let minY = Infinity;
+  for (let s0 = -1; s0 <= 1; s0 += 2)
+    for (let s1 = -1; s1 <= 1; s1 += 2)
+      for (let s2 = -1; s2 <= 1; s2 += 2) {
+        const y = py + h * (s0 * m[1] + s1 * m[5] + s2 * m[9]);
+        if (y < minY) minY = y;
+      }
+  const pen = MOTION_FLOOR_Y - minY;
+  if (pen <= 0) return;
+  // Centroid of the vertices sitting on (within tol of) the lowest plane.
+  const tol = 0.06 * h;
+  let cx = 0, cz = 0, n = 0;
+  for (let s0 = -1; s0 <= 1; s0 += 2)
+    for (let s1 = -1; s1 <= 1; s1 += 2)
+      for (let s2 = -1; s2 <= 1; s2 += 2) {
+        const y = py + h * (s0 * m[1] + s1 * m[5] + s2 * m[9]);
+        if (y <= minY + tol) {
+          cx += px + h * (s0 * m[0] + s1 * m[4] + s2 * m[8]);
+          cz += pz + h * (s0 * m[2] + s1 * m[6] + s2 * m[10]);
+          n++;
+        }
+      }
+  cx /= n; cz /= n;
+  b.position.y += pen;                                            // rest on the floor
+  _rA.set(cx, MOTION_FLOOR_Y, cz).sub(b.position);                // contact arm (manifold centroid)
+  const vn = _vrel.copy(st.ang).cross(_rA).add(st.vel).y;         // contact-point speed along +Y
+  if (vn < 0) {
+    // No floor bounce — just stop the descent (inelastic) so gravity can press it
+    // down and hold it there; an off-centre landing still imparts a little spin.
+    const jImp = -vn / invM;                                      // single body vs static plane
+    st.vel.y += jImp * invM;                                      // normal only — no friction
+    _Jv.set(0, jImp, 0);
+    st.ang.addScaledVector(_xprod.crossVectors(_rA, _Jv), invI * MOTION_CONTACT_SPIN);
+  }
+  // Settle: while resting gently, bleed only the TIPPING (rotation about the
+  // horizontal x/z axes) so a corner/edge landing flattens and stops jittering,
+  // while YAW about the vertical (y) is left free → twisting on the ground lives.
+  if (-vn < MOTION_SETTLE_SPEED) {
+    st.ang.x *= MOTION_SETTLE_DAMP;
+    st.ang.z *= MOTION_SETTLE_DAMP;
+  }
+  _motion.markMoved(i);
+}
+
+const MOTION_CONTACT_SPIN = 0.6;       // share of the lever torque injected as spin
+
+// Damp the component of `ang` perpendicular to unit `axis` (the rocking), leaving
+// the component along `axis` (the twist) intact. result = d·ang + (1−d)(ang·axis)axis.
+function _settlePerp(ang, axis, d) {
+  const along = ang.x * axis.x + ang.y * axis.y + ang.z * axis.z;   // ω·axis (twist), pre-damp
+  ang.multiplyScalar(d).addScaledVector(axis, (1 - d) * along);
+}
+
+// Resolve one SAT contact (normal _contact.n is A→B): split de-overlap, then an
+// EXTREMELY INELASTIC stop (no rebound — just remove the normal closing speed) so
+// attracting cubes snap together and settle, plus a tempered spin from the
+// contact-point lever. While resting, the rocking (⟂ to the normal) is bled off
+// so faces don't jitter, while twist about the normal is preserved.
+function _resolveSatContact(ia, ib, e, invM, invI) {
+  const bs = _motion.bodies, st = _anim.state;
+  const A = bs[ia], B = bs[ib];
+  const n = _contact.n;
+
+  A.position.addScaledVector(n, -_contact.depth * 0.5);
+  B.position.addScaledVector(n,  _contact.depth * 0.5);
+
+  const vrelN = _vrel.subVectors(st[ib].vel, st[ia].vel).dot(n);
+  if (vrelN < 0) {                               // approaching → inelastic stop (e≈0)
+    const jLin = -vrelN / (invM + invM);
+    _Jv.copy(n).multiplyScalar(jLin);
+    st[ia].vel.addScaledVector(_Jv, -invM);
+    st[ib].vel.addScaledVector(_Jv,  invM);
+    _rA.copy(_contact.point).sub(A.position);    // A feels −J at the contact point
+    _rB.copy(_contact.point).sub(B.position);    // B feels +J
+    st[ia].ang.addScaledVector(_xprod.copy(_rA).cross(_Jv), -invI * MOTION_CONTACT_SPIN);
+    st[ib].ang.addScaledVector(_xprod.copy(_rB).cross(_Jv),  invI * MOTION_CONTACT_SPIN);
+    // Settle the rocking (keep twist about the contact normal) so faces in gentle
+    // contact stop jittering but can still twist against each other.
+    if (-vrelN < MOTION_SETTLE_SPEED) {
+      _settlePerp(st[ia].ang, n, MOTION_SETTLE_DAMP);
+      _settlePerp(st[ib].ang, n, MOTION_SETTLE_DAMP);
+    }
+  }
+  _motion.markMoved(ia);
+  _motion.markMoved(ib);
+}
+
+function _resolveMotionContact() {
+  if (!_motion) return;
+  const bs = _motion.bodies, st = _anim.state;
+  const e = _animRestitution();
+  const mass = _bodyMassKg();
+  const invM = 1 / mass;
+  const invI = 6 / (mass * (2 * MOTION_CUBE_HALF) * (2 * MOTION_CUBE_HALF));   // isotropic cube
+
+  // ── Cube↔cube oriented-box (SAT) contact: corner-face, edge-face and edge-edge
+  //    all fall out of the 15-axis minimum-translation test, with a single
+  //    consistent normal that also recovers deep overlap correctly. ───────────
+  for (let a = 0; a < bs.length; a++) {
+    for (let b = a + 1; b < bs.length; b++) {
+      if (obbContact(bs[a].position, bs[a].quaternion, bs[b].position, bs[b].quaternion, MOTION_CUBE_HALF, _contact)) {
+        _resolveSatContact(a, b, e, invM, invI);
+      }
+    }
+  }
+
+  // ── World boundary: keep cubes in view, reflecting velocity with the same e ─
+  const lim = MOTION_WORLD_BOUND - MOTION_CUBE_HALF;
+  for (let i = 0; i < bs.length; i++) {
+    const p = bs[i].position;
+    const dist = p.length();
+    if (dist <= lim || dist <= 1e-6) continue;
+    _cN.copy(p).multiplyScalar(1 / dist);            // outward normal
+    p.addScaledVector(_cN, -(dist - lim));           // clamp back to the shell
+    const vn = st[i].vel.dot(_cN);
+    if (vn > 0) st[i].vel.addScaledVector(_cN, -(1 + e) * vn);   // reflect inward
+  }
+
+  // ── Bouncing floor (only when gravity is on) ───────────────────────────────
+  if (_animGravityG() > 0) {
+    for (let i = 0; i < bs.length; i++) _resolveFloor(i, e, invM, invI);
+  }
+}
+
+function motionStep(dt) {
+  if (!_motion) return;
+  const bodies = _motion.bodyDescriptors();
+  if (!_motionFieldsReady(bodies)) return;
+  _ensureAnimState();
+
+  // REAL SI dynamics: force is in Newtons, torque in N·m (from computeForces with
+  // the m² area element), mass in kg. So a = F/m and α = τ/I are genuine m/s² and
+  // rad/s² — the same physical scale as gravity. The Speed slider is just a
+  // time/strength multiplier on top (centre = 1× real time).
+  const forces = computeForces(_fieldStore, bodies, MOTION_CUBE_HALF, 0.25, MOTION_FORCE_FACEG, SCENE_TO_M);
+  _motionForces = forces;
+  const speedMul = _animSpeedMul();
+  const mass = _bodyMassKg();                          // kg
+  const sideM = 2 * MOTION_CUBE_HALF * SCENE_TO_M;     // cube edge in metres
+  const invI = 6 / (mass * sideM * sideM);             // 1/(kg·m²), isotropic cube
+  const accelToScene = 1 / (mass * SCENE_TO_M);        // N → scene-units/s²  (a = F/m, then /SCENE_TO_M)
+  const damp = _animDamping();
+  const gAccel = _animGravityG() * G_EARTH_SCENE * speedMul;
+
+  // Sub-step the integrate→collide loop. The count ADAPTS to BOTH the fastest
+  // corner speed (so a cube can't tunnel through its neighbour between contact
+  // checks) AND the peak acceleration incl. gravity (so a stiff, high-drive field
+  // — force ∝ drive² — takes finer steps instead of injecting energy and ringing).
+  // Force is held constant across the frame's substeps; damping is spread evenly.
+  const cornerR = 1.7320508 * MOTION_CUBE_HALF;   // √3·h — cube's centre-to-corner
+  let vmax = 1e-6, amax = gAccel;
+  for (const st of _anim.state) vmax = Math.max(vmax, st.vel.length() + st.ang.length() * cornerR);
+  for (const r of forces) {
+    const a = Math.min(r.force.length() * accelToScene, MOTION_AMAX) * speedMul;
+    if (a > amax) amax = a;
+  }
+  if (!isFinite(vmax)) vmax = MOTION_VMAX;
+  const maxDisp = 0.2 * MOTION_CUBE_HALF;           // cap displacement per substep
+  const need = (vmax * dt + 0.5 * amax * dt * dt) / maxDisp;
+  const SUB = Math.max(4, Math.min(MOTION_MAXSUB, Math.ceil(need)));
+  const sdt = dt / SUB;
+  const linS = Math.pow(damp.lin, 1 / SUB), angS = Math.pow(damp.ang, 1 / SUB);
+
+  for (let s = 0; s < SUB; s++) {
+    for (let i = 0; i < _motion.bodies.length; i++) {
+      const st = _anim.state[i], r = forces[i], body = _motion.bodies[i];
+      // a = F/m (→ scene units), α = τ/I; clamp the *acceleration* (not the raw
+      // force) so the near-singular contact field can't fling a cube to infinity.
+      _acc.copy(r.force).multiplyScalar(accelToScene);
+      _alpha.copy(r.torque).multiplyScalar(invI);
+      _acc.multiplyScalar(_clampScale(_acc.length(), MOTION_AMAX));
+      _alpha.multiplyScalar(_clampScale(_alpha.length(), MOTION_ALPHAMAX));
+      st.vel.addScaledVector(_acc, speedMul * sdt).multiplyScalar(linS);
+      st.ang.addScaledVector(_alpha, speedMul * sdt).multiplyScalar(angS);
+      // Gravity is full near rest but is hard-capped at a tiny terminal fall
+      // speed (no per-substep overshoot), so a gravity-only landing arrives gently
+      // and the floor treats it as resting contact → no perpetual micro-bounce.
+      if (gAccel > 0 && st.vel.y > -MOTION_GRAV_VTERM) {
+        st.vel.y = Math.max(st.vel.y - gAccel * sdt, -MOTION_GRAV_VTERM);
+      }
+      // Hard speed caps — last line of defence against any runaway → NaN.
+      if (st.vel.lengthSq() > MOTION_VMAX * MOTION_VMAX) st.vel.setLength(MOTION_VMAX);
+      if (st.ang.lengthSq() > MOTION_WMAX * MOTION_WMAX) st.ang.setLength(MOTION_WMAX);
+      body.position.addScaledVector(st.vel, sdt);
+      const ox = st.ang.x, oy = st.ang.y, oz = st.ang.z, q = body.quaternion, h = 0.5 * sdt;
+      body.quaternion.set(
+        q.x + h * ( ox * q.w + oy * q.z - oz * q.y),
+        q.y + h * (-ox * q.z + oy * q.w + oz * q.x),
+        q.z + h * ( ox * q.y - oy * q.x + oz * q.w),
+        q.w + h * (-ox * q.x - oy * q.y - oz * q.z),
+      ).normalize();
+      _motion.markMoved(i);
+    }
+    _resolveMotionContact();
+  }
+
+  _guardMotionState();   // scrub any non-finite pose before it reaches the renderer
+
+  _motionBGrid = _motionBsurfSliderOn()
+    ? buildBMagGrid(_fieldStore, _motion.bodyDescriptors(), MOTION_GRID_HALF, MOTION_GRID_N) : null;
+  redrawMotionBsurf();
+  redrawMotionForces();
+  updateMotionSelReadout();
+  updateMotionPowerReadout();
+}
+
+function setMotionPlaying(on) {
+  _anim.playing = !!on && _currentView === "motion";
+  const btn = document.getElementById("motion-play-btn");
+  if (btn) btn.textContent = _anim.playing ? "\u23f8 Pause" : "\u25b6 Play";
+  if (_anim.playing) {
+    _ensureAnimState();
+    _anim.last = performance.now();
+  }
+}
+
+function saveMotionState() {
+  if (!_motion) return;
+  _motionSaved = _motion.bodies.map(b => ({ pos: b.position.toArray(), quat: b.quaternion.toArray() }));
+  try { localStorage.setItem("motionSaved", JSON.stringify(_motionSaved)); } catch { /* ignore */ }
+}
+
+function restoreMotionState() {
+  if (!_motion) return;
+  let saved = _motionSaved;
+  if (!saved) { try { saved = JSON.parse(localStorage.getItem("motionSaved") || "null"); } catch { saved = null; } }
+  if (!saved) return;
+  setMotionPlaying(false);
+  _ensureAnimState();
+  _zeroAnimState();
+  for (let i = 0; i < _motion.bodies.length && i < saved.length; i++) {
+    _motion.bodies[i].position.fromArray(saved[i].pos);
+    _motion.bodies[i].quaternion.fromArray(saved[i].quat);
+    _motion.markMoved(i);
+  }
+  scheduleMotionField();
+}
+
+document.getElementById("motion-play-btn")?.addEventListener("click", () => setMotionPlaying(!_anim.playing));
+document.getElementById("motion-step-btn")?.addEventListener("click", () => {
+  setMotionPlaying(false);
+  _ensureAnimState();
+  motionStep(1 / 60);
+});
+document.getElementById("motion-save-btn")?.addEventListener("click", saveMotionState);
+document.getElementById("motion-restore-btn")?.addEventListener("click", restoreMotionState);
+const _motionSpeedSlider = document.getElementById("motion-speed-slider");
+if (_motionSpeedSlider) { _motionSpeedSlider.addEventListener("input", _updateSpeedReadout); _updateSpeedReadout(); }
+const _motionDragSlider = document.getElementById("motion-drag-slider");
+if (_motionDragSlider) { _motionDragSlider.addEventListener("input", _updateDragReadout); _updateDragReadout(); }
+const _motionBounceSlider = document.getElementById("motion-bounce-slider");
+if (_motionBounceSlider) { _motionBounceSlider.addEventListener("input", _updateBounceReadout); _updateBounceReadout(); }
+const _motionGravSlider = document.getElementById("motion-grav-slider");
+if (_motionGravSlider) {
+  _motionGravSlider.addEventListener("input", () => { _updateGravReadout(); updateMotionFloor(); });
+  _updateGravReadout();
+}
 
 // ─── UI controls ──────────────────────────────────────────────────────────────
 function bindSlider(id, valId, decimals, cb) {
@@ -1408,6 +2111,12 @@ if (_blineMuSlider) {
 // ─── Render loop ──────────────────────────────────────────────────────────────
 function tick() {
   requestAnimationFrame(tick);
+  if (_anim.playing && _currentView === "motion") {
+    const now = performance.now();
+    const dt = Math.min((now - _anim.last) / 1000, 0.05);   // clamp big frame gaps
+    _anim.last = now;
+    if (dt > 0) motionStep(dt);
+  }
   controls.update();
   renderer.render(scene, camera);
 }

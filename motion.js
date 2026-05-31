@@ -16,7 +16,7 @@ import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeom
 
 // ── Cube envelope geometry (matches cube_config.py: 32 mm edge, 5 mm fillet,
 //    MM_TO_SCENE = 0.1 → 3.2 scene-unit cube, 0.5 fillet radius) ───────────────
-const HALF = 1.6;     // half edge in scene units (FRAME_EDGE_MM/2 * MM_TO_SCENE)
+export const HALF = 1.6;     // half edge in scene units (FRAME_EDGE_MM/2 * MM_TO_SCENE)
 const RR   = 0.5;     // corner/edge fillet radius   (FRAME_INSET_MM * MM_TO_SCENE)
 const SEG  = 6;       // rounded-box subdivision
 
@@ -183,6 +183,12 @@ function buildBody(state) {
   // North arrows for every energised edge, with the orientation rotation applied.
   const weights = MOTION_CONFIGS[state.config] ?? {};
   const R = orientationMatrix(state.axis, state.roll);
+
+  // Field-sampling metadata: which config's B grid, the canonical→oriented
+  // rotation baked into the arrows, and the linear current×polarity scale.
+  body.userData.config = state.config ?? "face";
+  body.userData.orientQuat = new THREE.Quaternion().setFromRotationMatrix(R);
+  body.userData.fieldScale = drive.currentScale * drive.polarity;
   for (const [edge, w] of Object.entries(weights)) {
     if (!w) continue;
     const [ca, cb] = EDGE_CORNERS[edge];
@@ -259,6 +265,23 @@ export class MotionStage {
 
   // Mark a body as hand-placed so its pose persists across rebuilds.
   markMoved(i) { if (i >= 0) this._moved[i] = true; }
+
+  // Field-sampling descriptors for the physics engine. qTot maps a vector in
+  // the cube's canonical (solver) frame to world: drag rotation ∘ axis/roll.
+  bodyDescriptors() {
+    const I = new THREE.Quaternion();
+    return this._bodies.map(b => {
+      const u = b.userData;
+      const qTot = b.quaternion.clone().multiply(u.orientQuat ?? I);
+      return {
+        config: u.config ?? "face",
+        scale:  u.fieldScale ?? 1,
+        pos:    b.position.clone(),
+        qTot,
+        qInv:   qTot.clone().invert(),
+      };
+    });
+  }
 
   setVisible(v) { this.group.visible = !!v; }
 

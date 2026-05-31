@@ -18,12 +18,39 @@ Run:      python -u server.py
 
 import asyncio
 import json
+import os
+import struct
 
+import numpy as np
 import websockets
 from websockets import serve
 
 import ng_config
 from scene_registry import build_scene, get_scene_id, invalidate_all_caches, list_scenes
+
+_FIELD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fields")
+
+
+def _pack_field(cfg: str) -> bytes | None:
+    """Read fields/12dipoles_<cfg>.npz and pack it into one binary frame:
+    [uint32 header_len][utf-8 JSON header][Bx f32][By f32][Bz f32] (C-order).
+    Returns None if the file is missing."""
+    path = os.path.join(_FIELD_DIR, f"12dipoles_{cfg}.npz")
+    if not os.path.exists(path):
+        return None
+    d = np.load(path)
+    bx = np.ascontiguousarray(d["Bx"], dtype="<f4")
+    by = np.ascontiguousarray(d["By"], dtype="<f4")
+    bz = np.ascontiguousarray(d["Bz"], dtype="<f4")
+    size = [int(x) for x in d["size"]]
+    origin = [float(x) for x in d["origin_mm"]]
+    spacing = float(d["spacing_mm"])
+    bmag_max = float(np.sqrt(bx * bx + by * by + bz * bz).max())
+    hdr = json.dumps({
+        "config": cfg, "size": size, "origin_mm": origin,
+        "spacing_mm": spacing, "max_B_T": bmag_max,
+    }).encode("utf-8")
+    return struct.pack("<I", len(hdr)) + hdr + bx.tobytes() + by.tobytes() + bz.tobytes()
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 clients:      set  = set()
@@ -98,6 +125,27 @@ async def handler(ws):
                 if t == "ui_state":
                     ui_state.update(msg)
                     print(f"[ui]  strength={msg.get('strength')}")
+
+                elif t == "motion_meta":
+                    import scene_ng12dipoles
+                    pw = await asyncio.to_thread(scene_ng12dipoles.power_by_config)
+                    mass = await asyncio.to_thread(scene_ng12dipoles.cube_mass)
+                    await ws.send(json.dumps({
+                        "type": "motion_meta", "power_W": pw, "mass_g": mass,
+                    }))
+                    print(f"[motion] sent power_by_config ({len(pw)} configs), "
+                          f"mass={mass['total_mass_g']:.1f} g")
+
+                elif t == "load_field":
+                    cfg = str(msg.get("config", "face")).strip().lower()
+                    payload = await asyncio.to_thread(_pack_field, cfg)
+                    if payload is None:
+                        await ws.send(json.dumps({"type": "field_error", "config": cfg,
+                                                  "error": "field file not found"}))
+                        print(f"[field] MISSING {cfg}")
+                    else:
+                        await ws.send(payload)
+                        print(f"[field] sent {cfg} ({len(payload):,} bytes)")
 
                 elif t == "scene":
                     sid = msg.get("scene", "1dipole")
