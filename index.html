@@ -88,6 +88,15 @@
         color: #8b949e;
         font-size: 11px;
       }
+      #controls span#drive-readout {
+        flex: 1 1 auto;
+        text-align: right;
+        white-space: nowrap;
+      }
+      #controls span#bsurf-val {
+        flex: 0 0 52px;
+        white-space: nowrap;
+      }
       #controls label.checkbox {
         justify-content: flex-start;
         gap: 6px;
@@ -109,6 +118,13 @@
 
       .control-section.hidden { display: none; }
 
+      /* Motion view shows only the per-box dropdowns; cylinder-only controls hide. */
+      #motion-controls { display: none; }
+      #controls.view-motion #motion-controls { display: block; }
+      #controls.view-motion #cylinder-controls,
+      #controls.view-motion #strength-control,
+      #controls.view-motion #config-mode-label { display: none; }
+
       #restart-btn, #solve-btn {
         width: 100%;
         border-radius: 6px;
@@ -121,7 +137,8 @@
         border: 1px solid #30363d;
         color: #c9d1d9;
       }
-      #restart-btn:hover { background: #30363d; }
+      #restart-btn:hover:not(:disabled) { background: #30363d; }
+      #restart-btn:disabled { color: #6e7681; cursor: default; opacity: 0.6; }
       #solve-btn {
         background: #1f6feb;
         border: 1px solid #388bfd;
@@ -129,6 +146,24 @@
         font-weight: 600;
       }
       #solve-btn:hover { background: #388bfd; }
+      #build-fields-btn {
+        flex: 0 0 auto;
+        border-radius: 5px;
+        padding: 1px 8px;
+        font-size: 11px;
+        cursor: pointer;
+        background: #1f6feb;
+        border: 1px solid #388bfd;
+        color: #fff;
+        font-weight: 600;
+      }
+      #build-fields-btn:hover:not(:disabled) { background: #388bfd; }
+      #build-fields-btn:disabled {
+        background: #30363d;
+        border-color: #30363d;
+        color: #8b949e;
+        cursor: default;
+      }
       #solve-btn:disabled {
         background: #30363d;
         border-color: #30363d;
@@ -173,7 +208,7 @@
       <div id="viewport">
         <div id="app"></div>
         <div id="hover-info"></div>
-        <div id="hint">Hover face → corner (c1–c8) · Peel to see inside</div>
+        <div id="hint">Hover face → corner (c1–c8)</div>
       </div>
 
       <aside id="controls">
@@ -183,16 +218,24 @@
             <select id="mode-select">
               <option value="cylinder:1dipole">1 dipole</option>
               <option value="cylinder:12dipoles_ng">12 dipoles</option>
+              <option value="cylinder:potcore_ng">1 pot core</option>
               <option value="cylinder:30coils_ng">30 coils</option>
-              <option value="cylinder:frame">30 coils (voxel)</option>
-              <option value="cylinder:dipole">Dipole (voxel)</option>
-              <option value="cylinder:12dipoles">12 dipoles (voxel)</option>
-              <option value="spinning_cubes">Spinning cubes</option>
+              <option value="motion:12dipoles_ng">12 dipole motion</option>
+            </select>
+          </label>
+          <label id="config-mode-label" class="mode-label" title="Coil excitation pattern for the 12-dipole scene. Each pattern drives a different set of edge coils; we run all of them to build the per-config field/solver files. (Other scenes have a single fixed config.)">
+            <select id="config-select" disabled>
+              <option value="face">face</option>
+              <option value="edge">edge</option>
+              <option value="twist1">twist1</option>
+              <option value="twist2">twist2</option>
+              <option value="corner">corner</option>
+              <option value="dipole">dipole</option>
             </select>
           </label>
         </div>
 
-        <label title="Coil drive / current scale (logarithmic: 0.1× … 10×, centre = 1×). In the NGSolve scene this is the knob that pushes iron into saturation.">
+        <label id="strength-control" title="Coil drive / current scale (logarithmic: 0.1× … 10×, centre = 1×). In the NGSolve scene this is the knob that pushes iron into saturation.">
           Strength
           <input type="range" id="strength-slider" min="0" max="1" step="0.001" value="0.5">
           <span class="val" id="strength-val">1.00</span>
@@ -204,60 +247,127 @@
             <input type="range" id="ou-opacity-slider" min="0" max="1" step="0.01" value="0.35">
             <span class="val" id="ou-opacity-val">0.35</span>
           </label>
-          <label title="Cy, Ca, Pl, Hs structural voxels">
+          <label title="Steel solid skin (NGSolve mesh surface)">
             Parts
             <input type="range" id="opacity-slider" min="0" max="1" step="0.01" value="0.5">
             <span class="val" id="opacity-val">0.50</span>
           </label>
-          <label title="NGSolve mesh opacity — all 3 regions (steel grey, coil amber, air blue). Also controls Gm debug grid in voxel scenes.">
+          <label title="NGSolve mesh opacity — steel grey, coil amber, air blue wireframe">
             Mesh
             <input type="range" id="metal-opacity-slider" min="0" max="1" step="0.01" value="0">
             <span class="val" id="metal-opacity-val">0.00</span>
           </label>
-          <label title="Cu / Cv current arrows">
+          <label title="Coil current arrows">
             Current
             <input type="range" id="current-opacity-slider" min="0" max="1" step="0.01" value="0.85">
             <span class="val" id="current-opacity-val">0.85</span>
-          </label>
-          <label title="Cm coil-grid J arrows (debug)">
-            Cur debug
-            <input type="range" id="current-debug-opacity-slider" min="0" max="1" step="0.01" value="0">
-            <span class="val" id="current-debug-opacity-val">0.00</span>
           </label>
           <label title="Traced B-field lines">
             B lines
             <input type="range" id="bline-opacity-slider" min="0" max="1" step="0.01" value="0.9">
             <span class="val" id="bline-opacity-val">0.90</span>
           </label>
-          <label title="Hides voxels closer than this distance to the camera">
-            Peel (cam)
-            <input type="range" id="peel-slider" min="0" max="6.5" step="0.02" value="0">
-            <span class="val" id="peel-val">0.00</span>
+          <label title="Force-metric isosurface: far left = off. Moving right raises the level (logarithmic), shrinking the surface toward the strongest field. The metric is the magnetic pressure B²/2μ₀ — the attractive force density between two equal fields facing each other — so it is an isosurface of |B|. Drawn at the B-lines opacity.">
+            B surf
+            <input type="range" id="bsurf-slider" min="0" max="1" step="0.001" value="0">
+            <span class="val" id="bsurf-val">off</span>
           </label>
-          <label title="Steel UNSATURATED permeability μ_init for the B-line solve (log scale); 1 = air. In the NGSolve scene the iron also saturates toward ~1.8 T (B–H curve), so high μ only holds until the drive pushes it into saturation.">
+          <label title="Steel UNSATURATED permeability μ_init for the B-line solve (log scale); 1 = air.">
             Steel μ
             <input type="range" id="bline-mu-slider" min="0" max="1" step="0.001" value="0.811">
             <span class="val" id="bline-mu-val">1000</span>
           </label>
+          <div class="checkbox" style="display:flex;align-items:center;gap:8px;">
+            <label class="checkbox" style="flex:0 0 auto;width:auto;" title="Ext grid: enlarge the meshed air box (≈200 mm vs 76 mm) so the far field needed for later two-body force/motion work is captured. Toggling rebuilds the mesh (coarser far-air elements keep it tractable). Does not solve.">
+              <input type="checkbox" id="extgrid-checkbox">
+              Ext grid
+            </label>
+            <button id="build-fields-btn" disabled title="Build field files (12-dipole scene): turn on the extended grid, set Strength to 1×, rebuild the grid once, then solve every config (face / edge / twist1 / twist2 / corner) as a linear basis and write one reusable vector-B field file per config — each recording exactly which dipoles are driven and at what weight — into the /fields folder. Progress shows under the Solve button.">build</button>
+          </div>
           <label class="checkbox" title="Sat ON = nonlinear B–H saturation for typical iron (Newton + current ramping; slower, physically correct). Sat OFF = fast linear solve at the slider μ (no saturation). NGSolve scene only.">
             <input type="checkbox" id="sat-checkbox">
             Sat
+            <span class="val" id="drive-readout" title="Ohmic power at the current Strength (solid-copper winding, ∝ strength²) and total mass of iron + copper.">—</span>
           </label>
           <button id="solve-btn">Solve B field</button>
           <div id="solve-status"></div>
         </div>
 
-        <div id="spin-controls" class="control-section hidden">
-          <label>
-            Spin
-            <input type="range" id="spin-slider" min="0" max="5" step="0.1" value="0.8">
-            <span class="val" id="spin-val">0.8</span>
+        <div id="motion-controls" class="control-section">
+          <div class="panel-title">Box A</div>
+          <label class="mode-label" title="Box A excitation pattern (which edge coils are driven).">
+            <select id="cfgA">
+              <option value="face">face</option>
+              <option value="edge">edge</option>
+              <option value="twist1">twist1</option>
+              <option value="twist2">twist2</option>
+              <option value="corner">corner</option>
+              <option value="dipole">dipole</option>
+            </select>
           </label>
-          <label>
-            Damping
-            <input type="range" id="damp-slider" min="0.90" max="1.00" step="0.001" value="0.985">
-            <span class="val" id="damp-val">0.985</span>
+          <label class="mode-label" title="Box A orientation: primary face-axis the config points along.">
+            <select id="axisA">
+              <option value="+Z">+Z</option>
+              <option value="-Z">-Z</option>
+              <option value="+X">+X</option>
+              <option value="-X">-X</option>
+              <option value="+Y">+Y</option>
+              <option value="-Y">-Y</option>
+            </select>
           </label>
+          <label class="mode-label" title="Box A roll: NSEW rotation about the chosen axis (N=0°, E=90°, S=180°, W=270°).">
+            <select id="rollA">
+              <option value="N">N</option>
+              <option value="E">E</option>
+              <option value="S">S</option>
+              <option value="W">W</option>
+            </select>
+          </label>
+          <label title="Box A power & polarity: magnitude = current on a log scale 0.1×–1× (1%–100% power, since power ∝ current²); sign reverses polarity (flips all arrows).">
+            Power
+            <input type="range" id="powA" min="-1" max="1" step="0.01" value="1">
+            <span class="val" id="powA-val">+100%</span>
+          </label>
+
+          <div class="panel-title">Box B</div>
+          <label class="mode-label" title="Box B excitation pattern (which edge coils are driven).">
+            <select id="cfgB">
+              <option value="face">face</option>
+              <option value="edge">edge</option>
+              <option value="twist1">twist1</option>
+              <option value="twist2">twist2</option>
+              <option value="corner">corner</option>
+              <option value="dipole">dipole</option>
+            </select>
+          </label>
+          <label class="mode-label" title="Box B orientation: primary face-axis the config points along.">
+            <select id="axisB">
+              <option value="+Z">+Z</option>
+              <option value="-Z">-Z</option>
+              <option value="+X">+X</option>
+              <option value="-X">-X</option>
+              <option value="+Y">+Y</option>
+              <option value="-Y">-Y</option>
+            </select>
+          </label>
+          <label class="mode-label" title="Box B roll: NSEW rotation about the chosen axis (N=0°, E=90°, S=180°, W=270°).">
+            <select id="rollB">
+              <option value="N">N</option>
+              <option value="E">E</option>
+              <option value="S">S</option>
+              <option value="W">W</option>
+            </select>
+          </label>
+          <label title="Box B power & polarity: magnitude = current on a log scale 0.1×–1× (1%–100% power, since power ∝ current²); sign reverses polarity (flips all arrows).">
+            Power
+            <input type="range" id="powB" min="-1" max="1" step="0.01" value="1">
+            <span class="val" id="powB-val">+100%</span>
+          </label>
+          <div id="motion-status" style="font-size:11px;color:#8b949e;margin-top:6px;">
+            Yellow arrows = magnetic north per energised edge. Drag to orbit.
+            Double-click a cube to grab it (tints orange): drag = rotate it,
+            right-drag = move it. Double-click empty space to release.
+          </div>
         </div>
 
         <button id="restart-btn">Restart</button>

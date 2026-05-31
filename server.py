@@ -1,102 +1,89 @@
 #!/usr/bin/env python3
 """
-server.py  -  Python driver for the rounded-cube FEA viewer
+server.py  -  Python driver for the rounded-cube NGSolve viewer
 
 Messages  Python -> Browser:
-  { "type": "voxel_scene", ... }          experiment geometry (on connect / scene change)
-  { "type": "frame", "cubes": [...] }     spinning-cubes animation (streamed at ~30 fps)
+  { "type": "fea_mesh", ... }             scene geometry (on connect / scene change)
+  { "type": "bfield_lines", ... }         traced B-field lines after solve
 
 Messages  Browser -> Python:
   { "type": "ui_state",  "spin": f, "damping": f, "strength": f }
-  { "type": "view",      "view": "cylinder" | "spinning_cubes" }
-  { "type": "scene",     "scene": "frame" | "dipole" }
-  { "type": "fea_start", "strength": f }
+  { "type": "scene",     "scene": "1dipole" | "12dipoles_ng" | "30coils_ng" | "potcore_ng" }
   { "type": "solve_bfield", "strength": f, "mu_r": f, "saturate": bool }
 
-Install:  pip install websockets
+Install:  pip install websockets ngsolve netgen
 Run:      python -u server.py
           then open http://localhost:5173/rounded-cube-viewer/
 """
 
 import asyncio
 import json
-import math
 
 import websockets
 from websockets import serve
 
-from fea_config import FEA_SCENE_ID
-from fea_model import build_bfield_lines
+import ng_config
 from scene_registry import build_scene, get_scene_id, invalidate_all_caches, list_scenes
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 clients:      set  = set()
-ui_state:     dict = {"spin": 0.8, "damping": 0.985, "strength": 0.4}
-current_view: str  = "cylinder"
+ui_state:     dict = {"strength": 1.0}
 _active_scene: str  = get_scene_id()
 
-_voxel_scene_json: str = ""
+_scene_json: str = ""
+
+# NGSolve/Netgen native code is not thread-safe: two solves running at once
+# (e.g. two browser tabs, or a manual Solve during a field-build sweep) can
+# corrupt memory and crash the process with an access violation. Serialize all
+# heavy solves through this lock.
+_solve_lock = asyncio.Lock()
 
 
-def _rebuild_scene_json(fea_strength_scale: float = 1.0) -> str:
-    global _voxel_scene_json
+def _rebuild_scene_json(strength_scale: float = 1.0) -> str:
+    global _scene_json
     invalidate_all_caches()
-    scene = build_scene(force=True, fea_strength_scale=fea_strength_scale)
-    _voxel_scene_json = json.dumps(scene, separators=(',', ':'))
-    return _voxel_scene_json
+    scene = build_scene(force=True, strength_scale=strength_scale)
+    _scene_json = json.dumps(scene, separators=(',', ':'))
+    return _scene_json
 
 
-def _set_scene(scene_id: str, fea_strength_scale: float = 1.0) -> None:
+def _patch_scene_coils(upd: dict) -> None:
+    """Merge a no-remesh coil_update into the cached scene JSON so reconnecting
+    clients see the current excitation (arrows / frame / drive) on the same mesh."""
+    global _scene_json
+    try:
+        scene = json.loads(_scene_json)
+    except Exception:
+        return
+    for k in ("cu", "frame_config", "voxel_size"):
+        if k in upd:
+            scene[k] = upd[k]
+    scene.setdefault("meta", {}).update(upd.get("meta", {}))
+    _scene_json = json.dumps(scene)
+
+
+def _set_scene(scene_id: str, strength_scale: float = 1.0) -> None:
     global _active_scene
-    import fea_config
-
-    sid = (scene_id or "frame").strip().lower()
+    sid = (scene_id or "1dipole").strip().lower()
     if sid not in {s for s, _ in list_scenes()}:
-        sid = "frame"
-    fea_config.FEA_SCENE_ID = sid
+        sid = "1dipole"
+    ng_config.NG_SCENE_ID = sid
     _active_scene = sid
-    _rebuild_scene_json(fea_strength_scale=fea_strength_scale)
+    _rebuild_scene_json(strength_scale=strength_scale)
 
 
 # Pre-build at startup
-_set_scene(FEA_SCENE_ID)
-
-
-# ── Spinning-cubes demo ───────────────────────────────────────────────────────
-
-def _make_quat(ax, ay, az, angle):
-    s = math.sin(angle / 2)
-    return [ax * s, ay * s, az * s, math.cos(angle / 2)]
-
-
-def _build_frame(t):
-    def ripple(phase):
-        return [
-            [0.5 + 0.5 * math.sin(t * 1.1 + fi * 0.9 + ci * 0.4 + phase)
-             for ci in range(9)]
-            for fi in range(6)
-        ]
-    return {
-        "type": "frame",
-        "cubes": [
-            {"id": "a", "pos": [-1.2, 0.0, 0.0],
-             "quat": _make_quat(0, 1, 0,  t * 0.4),  "coils": ripple(0.0)},
-            {"id": "b", "pos": [ 1.2, 0.0, 0.0],
-             "quat": _make_quat(1, 0, 0, -t * 0.3),  "coils": ripple(math.pi)},
-        ],
-    }
+_set_scene(get_scene_id())
 
 
 # ── WebSocket handler ─────────────────────────────────────────────────────────
 
 async def handler(ws):
-    global current_view
     clients.add(ws)
     print(f"[+] browser connected   (active: {len(clients)})")
     try:
-        # Default client mode is cylinder; always offer voxel payload on connect.
-        if _voxel_scene_json:
-            await ws.send(_voxel_scene_json)
+        if _scene_json:
+            await ws.send(_scene_json)
         await ws.send(json.dumps({
             "type": "scene_list",
             "active": _active_scene,
@@ -110,73 +97,142 @@ async def handler(ws):
 
                 if t == "ui_state":
                     ui_state.update(msg)
-                    print(f"[ui]  spin={msg.get('spin')}  "
-                          f"damp={msg.get('damping')}  "
-                          f"strength={msg.get('strength')}")
+                    print(f"[ui]  strength={msg.get('strength')}")
 
                 elif t == "scene":
-                    sid = msg.get("scene", "frame")
+                    sid = msg.get("scene", "1dipole")
                     print(f"[scene] {sid}")
-                    # Use coil_init table at full weight; Strength slider -> fea_start only.
-                    _set_scene(sid, fea_strength_scale=1.0)
-                    if current_view == "cylinder":
-                        await ws.send(_voxel_scene_json)
+                    _set_scene(sid, strength_scale=1.0)
+                    await ws.send(_scene_json)
                     await ws.send(json.dumps({
                         "type": "scene_list",
                         "active": _active_scene,
                         "scenes": [{"id": s, "label": l} for s, l in list_scenes()],
                     }))
 
-                elif t == "fea_start":
-                    scale = float(msg.get("strength", ui_state.get("strength", 1.0)))
-                    print(f"[fea] start  scene={_active_scene}  strength_scale={scale}")
-                    _rebuild_scene_json(fea_strength_scale=scale)
-                    if current_view == "cylinder":
-                        await ws.send(_voxel_scene_json)
+                elif t == "extended_grid":
+                    on = bool(msg.get("on", False))
+                    ng_config.NG_EXTENDED_GRID = on
+                    print(f"[grid] extended={'on' if on else 'off'} -> rebuild {_active_scene}")
+                    await asyncio.to_thread(_rebuild_scene_json)
+                    await ws.send(_scene_json)
+
+                elif t == "config":
+                    name = str(msg.get("config", "face")).strip().lower()
+                    if name in ng_config.NG12_CONFIGS:
+                        ng_config.NG12_CONFIG_ACTIVE = name
+                    if _active_scene == "12dipoles_ng":
+                        import scene_ng12dipoles
+                        upd = scene_ng12dipoles.coil_update()
+                        scene_ng12dipoles.invalidate_cache()
+                        _patch_scene_coils(upd)
+                        print(f"[config] {ng_config.NG12_CONFIG_ACTIVE} (no re-mesh)")
+                        await ws.send(json.dumps(upd))
+                    else:
+                        print(f"[config] {ng_config.NG12_CONFIG_ACTIVE} (ignored: {_active_scene})")
+
+                elif t == "build_fields":
+                    # Turn on the extended grid, force strength 1, push the enlarged
+                    # mesh to the viewer FIRST, then solve every config and write files.
+                    ng_config.NG_EXTENDED_GRID = True
+                    ui_state["strength"] = 1.0
+                    orig_cfg = ng_config.NG12_CONFIG_ACTIVE
+                    names = list(ng_config.NG12_CONFIGS.keys())
+                    total = len(names)
+                    print(f"[fields] start: {total} configs (extended grid, strength 1, linear)")
+                    await ws.send(json.dumps({"type": "build_fields_status",
+                                              "state": "start", "total": total}))
+                    try:
+                        # Rebuild + broadcast viewer mesh so the ext grid is visible
+                        # before the (slow) solve sweep begins.
+                        print("[fields] rebuilding viewer mesh (extended grid)…")
+                        await ws.send(json.dumps({"type": "build_fields_progress",
+                                                  "phase": "viewer_mesh", "total": total}))
+                        await asyncio.to_thread(_rebuild_scene_json)
+                        for c in list(clients):
+                            try:
+                                await c.send(_scene_json)
+                            except Exception:  # noqa: BLE001
+                                pass
+
+                        from ngsolve_solve import export_ng12_field_files
+                        gen = export_ng12_field_files(strength=1.0, mu_r=1.0, saturate=False)
+
+                        def _step():
+                            try:
+                                return next(gen)
+                            except StopIteration:
+                                return None
+
+                        files = []
+                        async with _solve_lock:
+                            while True:
+                                step = await asyncio.to_thread(_step)
+                                if step is None:
+                                    break
+                                if step.get("phase") == "solved":
+                                    files.append(step)
+                                await ws.send(json.dumps({"type": "build_fields_progress",
+                                                          **step}))
+
+                            # Restore the original config and push the (extended) mesh.
+                            ng_config.NG12_CONFIG_ACTIVE = orig_cfg
+                            await asyncio.to_thread(_rebuild_scene_json)
+                        for c in list(clients):
+                            try:
+                                await c.send(_scene_json)
+                            except Exception:  # noqa: BLE001
+                                pass
+                        await ws.send(json.dumps({"type": "build_fields_status",
+                                                  "state": "done", "total": total,
+                                                  "files": files}))
+                        print(f"[fields] done: {len(files)} files")
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[fields] FAILED: {type(exc).__name__}: {exc}")
+                        await ws.send(json.dumps({"type": "build_fields_status",
+                                                  "state": "error",
+                                                  "error": f"{type(exc).__name__}: {exc}"}))
 
                 elif t == "solve_bfield":
                     scale = float(msg.get("strength", ui_state.get("strength", 1.0)))
                     mu_r = float(msg.get("mu_r", 1.0))
                     saturate = bool(msg.get("saturate", True))
-                    print(f"[fea] solve_bfield  scene={_active_scene}  "
+                    print(f"[ng] solve_bfield  scene={_active_scene}  "
                           f"strength_scale={scale}  mu_r={mu_r:g}  saturate={saturate}")
                     await ws.send(json.dumps({"type": "bfield_status", "state": "solving"}))
                     try:
-                        if _active_scene == "1dipole":
-                            from ngsolve_solve import solve_ng_bfield
-                            payload = await asyncio.to_thread(
-                                solve_ng_bfield, mu_r=mu_r, fea_strength_scale=scale,
-                                saturate=saturate,
-                            )
-                        elif _active_scene == "12dipoles_ng":
-                            from ngsolve_solve import solve_ng12_bfield
-                            payload = await asyncio.to_thread(
-                                solve_ng12_bfield, mu_r=mu_r, fea_strength_scale=scale,
-                                saturate=saturate,
-                            )
-                        elif _active_scene == "30coils_ng":
-                            from ngsolve_solve import solve_ng30_bfield
-                            payload = await asyncio.to_thread(
-                                solve_ng30_bfield, mu_r=mu_r, fea_strength_scale=scale,
-                                saturate=saturate,
-                            )
-                        else:
-                            payload = await asyncio.to_thread(
-                                build_bfield_lines, fea_strength_scale=scale, mu_r=mu_r
-                            )
+                        async with _solve_lock:
+                            if _active_scene == "1dipole":
+                                from ngsolve_solve import solve_ng_bfield
+                                payload = await asyncio.to_thread(
+                                    solve_ng_bfield, mu_r=mu_r, fea_strength_scale=scale,
+                                    saturate=saturate,
+                                )
+                            elif _active_scene == "12dipoles_ng":
+                                from ngsolve_solve import solve_ng12_bfield
+                                payload = await asyncio.to_thread(
+                                    solve_ng12_bfield, mu_r=mu_r, fea_strength_scale=scale,
+                                    saturate=saturate,
+                                )
+                            elif _active_scene == "potcore_ng":
+                                from ngsolve_solve import solve_potcore_bfield
+                                payload = await asyncio.to_thread(
+                                    solve_potcore_bfield, mu_r=mu_r, fea_strength_scale=scale,
+                                    saturate=saturate,
+                                )
+                            else:
+                                from ngsolve_solve import solve_ng30_bfield
+                                payload = await asyncio.to_thread(
+                                    solve_ng30_bfield, mu_r=mu_r, fea_strength_scale=scale,
+                                    saturate=saturate,
+                                )
                         await ws.send(json.dumps(payload, separators=(',', ':')))
                     except Exception as exc:  # noqa: BLE001
-                        print(f"[fea] solve_bfield FAILED: {type(exc).__name__}: {exc}")
+                        print(f"[ng] solve_bfield FAILED: {type(exc).__name__}: {exc}")
                         await ws.send(json.dumps({
                             "type": "bfield_status", "state": "error",
                             "message": f"{type(exc).__name__}: {exc}",
                         }))
-
-                elif t == "view":
-                    current_view = msg.get("view", "cylinder")
-                    print(f"[view] {current_view}")
-                    if current_view == "cylinder":
-                        await ws.send(_voxel_scene_json)
 
             except (json.JSONDecodeError, KeyError):
                 pass
@@ -188,22 +244,6 @@ async def handler(ws):
         print(f"[-] browser disconnected (active: {len(clients)})")
 
 
-# ── Broadcast loop ─────────────────────────────────────────────────────────────
-
-async def broadcast_loop(fps=30):
-    t  = 0.0
-    dt = 1.0 / fps
-    while True:
-        if clients and current_view == "spinning_cubes":
-            frame = json.dumps(_build_frame(t))
-            await asyncio.gather(
-                *[c.send(frame) for c in list(clients)],
-                return_exceptions=True,
-            )
-        t  += dt
-        await asyncio.sleep(dt)
-
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
@@ -211,10 +251,10 @@ async def main():
     print("  Cube viewer Python server")
     print("  WebSocket : ws://localhost:8765")
     print("  Browser   : http://localhost:5173/rounded-cube-viewer/")
-    print(f"  Scene     : {_active_scene}  (coil_init.py per scene; restart after edits)")
+    print(f"  Scene     : {_active_scene}  (ng_config.py; restart after edits)")
     print("-" * 52)
     async with serve(handler, "localhost", 8765):
-        await broadcast_loop()
+        await asyncio.Future()
 
 
 if __name__ == "__main__":
@@ -222,4 +262,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nServer stopped.")
-

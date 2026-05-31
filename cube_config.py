@@ -1,6 +1,6 @@
 """cube_config.py — Shared cube envelope only (all experiments use this outline).
 
-Scene-specific metal/coil geometry lives in fea_config.py and scene modules.
+Scene-specific geometry lives in ng_config.py and scene modules.
 """
 
 # ── Cube envelope (always a cube) ─────────────────────────────────────────────

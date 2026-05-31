@@ -1,8 +1,8 @@
 import * as THREE from "three";
 import { OrbitControls }      from "three/examples/jsm/controls/OrbitControls.js";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
-
-import { CONFIG } from "./config.js";
+import { extractIsosurface }  from "./marching_cubes.js";
+import { MotionStage, MOTION_OFFSET, levelToDrive } from "./motion.js";
 
 // ─── Scene / camera / renderer ────────────────────────────────────────────────
 const container = document.getElementById("app");
@@ -48,7 +48,7 @@ controls.screenSpacePanning = true;
 controls.minDistance      = 1.5;
 controls.maxDistance      = 60;
 controls.target.set(0, 0, 0);
-controls.addEventListener("change", schedulePeelRefresh);
+controls.addEventListener("change", scheduleResize);
 controls.mouseButtons = {
   LEFT:   THREE.MOUSE.ROTATE,
   MIDDLE: THREE.MOUSE.DOLLY,
@@ -72,292 +72,42 @@ const fill = new THREE.DirectionalLight(0x8899ff, 0.35);
 fill.position.set(-4, 2, -6);
 scene.add(fill);
 
-// ─── Ground & grid (spinning-cubes view only) ─────────────────────────────────
-const ground = new THREE.Mesh(
-  new THREE.PlaneGeometry(40, 40),
-  new THREE.MeshStandardMaterial({ color: 0x161b22, metalness: 0.05, roughness: 0.9 })
-);
-ground.rotation.x    = -Math.PI / 2;
-ground.position.y    = -CONFIG.CUBE_SIZE / 2 - 0.001;
-ground.receiveShadow = true;
-scene.add(ground);
+const CU_ARROW_MAX = 12_000;
 
-const grid = new THREE.GridHelper(20, 20, 0x30363d, 0x21262d);
-grid.position.y = ground.position.y + 0.001;
-scene.add(grid);
-
-// ─── Spinning-cubes: texture helpers ──────────────────────────────────────────
-const TEX_SIZE = 512;
-const CELL     = TEX_SIZE / 3;
-
-function powerToRGB(p) {
-  if (p < 0.5) {
-    const t = p * 2;
-    return [Math.round(t * 150), Math.round(220 - t * 70), Math.round(t * 150)];
-  }
-  const t = (p - 0.5) * 2;
-  return [Math.round(150 + t * 105), Math.round(150 - t * 150), Math.round(150 - t * 150)];
-}
-
-function drawCoil(ctx, cx, cy, cellSize, power) {
-  const [r, g, b] = powerToRGB(power);
-  const color = `rgb(${r},${g},${b})`;
-  const maxR  = cellSize * 0.36;
-  const lw    = cellSize * 0.066;
-  const gap   = lw * 0.45;
-  const rings = 4;
-
-  const grd = ctx.createRadialGradient(cx, cy, 0, cx, cy, maxR + lw * 3);
-  grd.addColorStop(0, `rgba(${r},${g},${b},0.18)`);
-  grd.addColorStop(1, "rgba(0,0,0,0)");
-  ctx.fillStyle = grd;
-  ctx.beginPath();
-  ctx.arc(cx, cy, maxR + lw * 3, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.fillStyle = "#070d14";
-  ctx.beginPath();
-  ctx.arc(cx, cy, maxR + lw * 1.1, 0, Math.PI * 2);
-  ctx.fill();
-
-  for (let i = 0; i < rings; i++) {
-    const ringR = maxR - i * (lw + gap);
-    if (ringR < lw / 2) break;
-    const alpha = 0.45 + 0.55 * ((rings - i) / rings);
-    ctx.strokeStyle = `rgba(${r},${g},${b},${alpha.toFixed(2)})`;
-    ctx.lineWidth   = lw;
-    ctx.beginPath();
-    ctx.arc(cx, cy, ringR, 0, Math.PI * 2);
-    ctx.stroke();
-  }
-
-  ctx.fillStyle   = color;
-  ctx.shadowColor = color;
-  ctx.shadowBlur  = lw * 2;
-  ctx.beginPath();
-  ctx.arc(cx, cy, lw * 0.75, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.shadowBlur  = 0;
-
-  const fs = Math.round(cellSize * 0.11);
-  ctx.fillStyle    = `rgba(${r},${g},${b},0.9)`;
-  ctx.font         = `bold ${fs}px monospace`;
-  ctx.textAlign    = "center";
-  ctx.textBaseline = "top";
-  ctx.fillText(`${Math.round(power * 100)}%`, cx, cy + maxR + lw * 1.5);
-}
-
-function drawFace(canvas, coils) {
-  const ctx = canvas.getContext("2d");
-  ctx.fillStyle = "#0c1520";
-  ctx.fillRect(0, 0, TEX_SIZE, TEX_SIZE);
-  ctx.strokeStyle = "#1c2838";
-  ctx.lineWidth   = 1;
-  for (let i = 1; i < 3; i++) {
-    ctx.beginPath(); ctx.moveTo(i * CELL, 0);       ctx.lineTo(i * CELL, TEX_SIZE); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(0, i * CELL);       ctx.lineTo(TEX_SIZE, i * CELL); ctx.stroke();
-  }
-  coils.forEach((c, idx) => {
-    const p = (typeof c === "object") ? c.power : c;
-    drawCoil(ctx, (idx % 3) * CELL + CELL / 2, Math.floor(idx / 3) * CELL + CELL / 2, CELL, p);
-  });
-}
-
-// ─── Spinning-cubes: module meshes ────────────────────────────────────────────
-const sharedGeo = new RoundedBoxGeometry(
-  CONFIG.CUBE_SIZE, CONFIG.CUBE_SIZE, CONFIG.CUBE_SIZE,
-  CONFIG.CUBE_SEGMENTS, CONFIG.CUBE_RADIUS
-);
-
-function createCubeModule(posX) {
-  const coilData = Array.from({ length: 6 }, () =>
-    Array.from({ length: 9 }, () => ({ power: Math.random() }))
-  );
-  const textures = Array.from({ length: 6 }, (_, fi) => {
-    const canvas = document.createElement("canvas");
-    canvas.width = canvas.height = TEX_SIZE;
-    drawFace(canvas, coilData[fi]);
-    const tex = new THREE.CanvasTexture(canvas);
-    tex.userData.canvas = canvas;
-    return tex;
-  });
-  const materials = textures.map(tex =>
-    new THREE.MeshStandardMaterial({ map: tex, metalness: 0.08, roughness: 0.6 })
-  );
-  const mesh = new THREE.Mesh(sharedGeo, materials);
-  mesh.castShadow = mesh.receiveShadow = true;
-  mesh.position.set(posX, 0, 0);
-  scene.add(mesh);
-  return { mesh, coilData, textures };
-}
-
-const cubeModules = [createCubeModule(-1.2), createCubeModule(1.2)];
-
-// ─── Voxel renderer: InstancedMesh setup ──────────────────────────────────────
-const VOXEL_CAPACITY = 200_000;
-const CAP_CAPACITY   = 300_000;
-const PLATE_CAPACITY =  60_000;
-const HS_CAPACITY    =  30_000;
-const GM_CAPACITY    = 300_000;
-const CU_ARROW_MAX   =  12_000;
-const CV_ARROW_MAX   =  20_000;
-
-const _voxGeo = new THREE.BoxGeometry(1, 1, 1);
-
-const voxelMat = new THREE.MeshStandardMaterial({
-  color: 0xffffff, metalness: 0.45, roughness: 0.45,
-  transparent: true, opacity: 1.0,
-});
-const capMat = new THREE.MeshStandardMaterial({
-  color: 0xffffff, metalness: 0.45, roughness: 0.45,
-  transparent: true, opacity: 1.0,
-});
-const plateMat = new THREE.MeshStandardMaterial({
-  color: 0xffffff, metalness: 0.45, roughness: 0.45,
-  transparent: true, opacity: 1.0,
-});
-const hsMat = new THREE.MeshStandardMaterial({
-  color: 0xffffff, metalness: 0.45, roughness: 0.45,
-  transparent: true, opacity: 1.0,
-});
-const voxelMesh = new THREE.InstancedMesh(_voxGeo, voxelMat, VOXEL_CAPACITY);
-const capMesh   = new THREE.InstancedMesh(_voxGeo, capMat,   CAP_CAPACITY);
-const plateMesh = new THREE.InstancedMesh(_voxGeo, plateMat, PLATE_CAPACITY);
-const hsMesh    = new THREE.InstancedMesh(_voxGeo, hsMat,    HS_CAPACITY);
-const gmMat = new THREE.MeshStandardMaterial({
-  color: 0x55cc66, metalness: 0.35, roughness: 0.5,
-  transparent: true, opacity: 1.0,
-});
-const gmMesh    = new THREE.InstancedMesh(_voxGeo, gmMat, GM_CAPACITY);
-voxelMesh.count = capMesh.count = plateMesh.count = hsMesh.count = gmMesh.count = 0;
-scene.add(voxelMesh);
-scene.add(capMesh);
-scene.add(plateMesh);
-scene.add(hsMesh);
-scene.add(gmMesh);
-
-// ─── Unified modes (one dropdown: experiments + spinning cubes) ───────────────
+// ─── NGSolve scene modes ──────────────────────────────────────────────────────
 const MODE_OPTIONS = [
-  { id: "cylinder:1dipole",      view: "cylinder",       scene: "1dipole",      label: "1 dipole" },
-  { id: "cylinder:12dipoles_ng", view: "cylinder",       scene: "12dipoles_ng", label: "12 dipoles" },
-  { id: "cylinder:30coils_ng",   view: "cylinder",       scene: "30coils_ng",   label: "30 coils" },
-  { id: "cylinder:frame",        view: "cylinder",       scene: "frame",        label: "30 coils (voxel)" },
-  { id: "cylinder:dipole",       view: "cylinder",       scene: "dipole",       label: "Dipole (voxel)" },
-  { id: "cylinder:12dipoles",    view: "cylinder",       scene: "12dipoles",    label: "12 dipoles (voxel)" },
-  { id: "spinning_cubes",        view: "spinning_cubes", scene: null,           label: "Spinning cubes" },
+  { id: "cylinder:1dipole",      view: "cylinder", scene: "1dipole",      label: "1 dipole" },
+  { id: "cylinder:12dipoles_ng", view: "cylinder", scene: "12dipoles_ng", label: "12 dipoles" },
+  { id: "cylinder:potcore_ng", view: "cylinder", scene: "potcore_ng", label: "1 pot core" },
+  { id: "cylinder:30coils_ng",   view: "cylinder", scene: "30coils_ng",   label: "30 coils" },
+  { id: "motion:12dipoles_ng",   view: "motion",   scene: "12dipoles_ng", label: "12 dipole motion" },
 ];
 
 // ─── View state (opacity sliders; 0 = hidden) ─────────────────────────────────
 let _currentView = "cylinder";
-let _activeScene = "frame";
-let _hasVoxelScene = false;
+let _currentModeId = "cylinder:1dipole";
+let _activeScene = "1dipole";
+let _motion = null;   // lazily-built MotionStage (motion view)
+let _selectedIdx = -1;   // debug: index of the hand-manipulated motion body (-1 = none)
+let _hasScene = false;
+let _driveBase = null;   // { total_current_A, total_power_W, n_active_coils } at 1×
 let _partsOpacity = 0.5;
 let _metalOpacity = 0.0;
 let _currentOpacity = 0.85;
-let _currentDebugOpacity = 0.0;
 
-let _cylObjects   = [];
-let _capObjects   = [];
-let _plateObjects = [];
-let _hsObjects    = [];
-let _cuObjects    = [];
-let _cuSendTimer  = null;
-let _coilWeights  = null;
-let _feaRunning   = false;
 let _cuFieldBase  = null;
-let _cvFieldBase  = null;
 let _cuArrowMesh       = null;
 let _cuArrowMeshBehind = null;
-let _cvArrowMesh       = null;
-let _cvArrowMeshBehind = null;
-let _cmArrowMesh  = null;
-let _cmFieldBase  = null;
-let _cvObjects    = [];
-/** Cm: copper grid J arrows (debug; default off). */
-const CM_ARROW_MAX = 50_000;
-const _cmDebugCol = new THREE.Color(0.95, 0.72, 0.15);
 let _ouGroup      = null;
 let _ouOpacity    = 0.35;
 let _sceneVoxelSize = 0.05;
-/** Slightly >1 so box faces overlap (removes grid-line gaps, esp. with transparency). */
-const VOXEL_FILL = 1.03;
-let _peelCamDist = 0;
-let _peelRaf = 0;
-const _camWorld = new THREE.Vector3();
-const _posCache = { cyl: null, cap: null, pl: null, hs: null, gm: null };
 
 const _cuUp   = new THREE.Vector3(0, 1, 0);
 const _cuDir  = new THREE.Vector3();
 const _cuCol  = new THREE.Color();
-const _cuQuat   = new THREE.Quaternion();
-
-// ─── Fill InstancedMesh from position array ───────────────────────────────────
+const _cuQuat = new THREE.Quaternion();
 const _dummy = new THREE.Object3D();
 
-function fillInstanced(imesh, positions, vs, minDistFromCam = 0) {
-  const cap = imesh.instanceMatrix.count;
-  const scale = vs * VOXEL_FILL;
-  let j = 0;
-  if (minDistFromCam > 0) {
-    camera.getWorldPosition(_camWorld);
-    const cx = _camWorld.x;
-    const cy = _camWorld.y;
-    const cz = _camWorld.z;
-    for (let i = 0; i < positions.length && j < cap; i++) {
-      const p = positions[i];
-      const dx = p[0] - cx;
-      const dy = p[1] - cy;
-      const dz = p[2] - cz;
-      if (dx * dx + dy * dy + dz * dz < minDistFromCam * minDistFromCam) continue;
-      _dummy.position.set(p[0], p[1], p[2]);
-      _dummy.scale.setScalar(scale);
-      _dummy.updateMatrix();
-      imesh.setMatrixAt(j++, _dummy.matrix);
-    }
-  } else {
-    const n = Math.min(positions.length, cap);
-    for (let i = 0; i < n; i++) {
-      _dummy.position.set(positions[i][0], positions[i][1], positions[i][2]);
-      _dummy.scale.setScalar(scale);
-      _dummy.updateMatrix();
-      imesh.setMatrixAt(i, _dummy.matrix);
-    }
-    j = n;
-  }
-  imesh.count = j;
-  imesh.instanceMatrix.needsUpdate = true;
-}
-
-function _clearInstanced(imesh) {
-  imesh.count = 0;
-  imesh.instanceMatrix.needsUpdate = true;
-}
-
-function refreshVoxelMeshes() {
-  const vs = _sceneVoxelSize;
-  const peel = _peelCamDist;
-  if (_posCache.cyl) fillInstanced(voxelMesh, _posCache.cyl, vs, peel);
-  else _clearInstanced(voxelMesh);
-  if (_posCache.cap) fillInstanced(capMesh, _posCache.cap, vs, peel);
-  else _clearInstanced(capMesh);
-  if (_posCache.pl) fillInstanced(plateMesh, _posCache.pl, vs, peel);
-  else _clearInstanced(plateMesh);
-  if (_posCache.hs) fillInstanced(hsMesh, _posCache.hs, vs, peel);
-  else _clearInstanced(hsMesh);
-  if (_posCache.gm) fillInstanced(gmMesh, _posCache.gm, vs, peel);
-  else _clearInstanced(gmMesh);
-}
-
-function schedulePeelRefresh() {
-  if (_peelCamDist <= 0) return;
-  if (_peelRaf) return;
-  _peelRaf = requestAnimationFrame(() => {
-    _peelRaf = 0;
-    refreshVoxelMeshes();
-  });
-}
-
-// ─── Cu / Cv FEA fields: instanced arrow glyphs ─────────────────────────────
 function _disposeArrowMesh(mesh) {
   if (!mesh) return;
   scene.remove(mesh);
@@ -382,13 +132,12 @@ function _coilArrowColor(a) {
   return _cuCol;
 }
 
-function _applyCurrentArrows(field, vs, maxCount, renderOrder, logTag, feaScale = 1.0) {
+function _applyCurrentArrows(field, vs, maxCount, renderOrder, logTag) {
   if (!field?.sites?.positions?.length) return null;
 
   const pos = field.sites.positions;
   const dir = field.sites.directions;
   const amp = field.sites.amplitudes;
-  const scale = _feaRunning ? feaScale : 1.0;
   const n   = Math.min(pos.length, dir.length, amp.length, maxCount);
   _setCoilPalette(field.color_positive, field.color_negative);
 
@@ -425,7 +174,7 @@ function _applyCurrentArrows(field, vs, maxCount, renderOrder, logTag, feaScale 
       _dummy.quaternion.copy(_cuQuat);
     }
 
-    const a   = amp[i] * scale;
+    const a   = amp[i];
     const mag = Math.min(1, Math.abs(a));
     const s   = 0.55 + 0.45 * mag;
     _dummy.scale.set(s, s, s);
@@ -476,96 +225,6 @@ function clearCuArrows() {
   _cuArrowMeshBehind = null;
 }
 
-function clearCvArrows() {
-  _disposeArrowMesh(_cvArrowMesh);
-  _disposeArrowMesh(_cvArrowMeshBehind);
-  _cvArrowMesh = null;
-  _cvArrowMeshBehind = null;
-}
-
-/** Instanced cones on fea_grid coil cells (Cu + Cv); direction from J (uniform debug color). */
-function _applyCmGridArrows(coil, vs) {
-  if (!coil?.positions?.length || !coil?.J?.length) return null;
-
-  const pos = coil.positions;
-  const J   = coil.J;
-  const n   = Math.min(pos.length, J.length, CM_ARROW_MAX);
-
-  const baseLen = Math.max(vs * 3.5, 0.14);
-  const baseRad = baseLen * 0.24;
-  const geo = new THREE.ConeGeometry(baseRad, baseLen, 6);
-  geo.translate(0, baseLen * 0.5, 0);
-  const mat = new THREE.MeshBasicMaterial({
-    toneMapped: false,
-    transparent: true,
-    opacity: _currentDebugOpacity,
-    depthTest: true,
-    depthWrite: false,
-  });
-  const mesh = new THREE.InstancedMesh(geo, mat, n);
-  mesh.frustumCulled = false;
-  mesh.renderOrder = 12;
-
-  let count = 0;
-  for (let i = 0; i < n; i++) {
-    const jx = J[i][0];
-    const jy = J[i][1];
-    const jz = J[i][2];
-    const mag = Math.hypot(jx, jy, jz);
-    if (mag < 1e-8) continue;
-    _cuDir.set(jx / mag, jy / mag, jz / mag);
-
-    _dummy.position.set(pos[i][0], pos[i][1], pos[i][2]);
-    _cuQuat.setFromUnitVectors(_cuUp, _cuDir);
-    if (Number.isNaN(_cuQuat.x)) {
-      _dummy.quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
-    } else {
-      _dummy.quaternion.copy(_cuQuat);
-    }
-
-    const s = 0.5 + 0.25 * Math.min(1, mag / 1.5);
-    _dummy.scale.set(s, s, s);
-    _dummy.updateMatrix();
-    mesh.setMatrixAt(count, _dummy.matrix);
-    mesh.setColorAt(count, _cmDebugCol);
-    count++;
-  }
-  mesh.count = count;
-  mesh.instanceMatrix.needsUpdate = true;
-  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  scene.add(mesh);
-  if (count < n) {
-    console.warn(`[Cm] showing ${count.toLocaleString()} / ${n.toLocaleString()} (raise CM_ARROW_MAX)`);
-  } else {
-    console.info(`[Cm] ${count.toLocaleString()} coil-grid J arrows (Cu + Cv)`);
-  }
-  return mesh;
-}
-
-function clearCmArrows() {
-  _disposeArrowMesh(_cmArrowMesh);
-  _cmArrowMesh = null;
-}
-
-function clearCmField() {
-  clearCmArrows();
-  _cmFieldBase = null;
-}
-
-function rebuildCmArrows(vs) {
-  clearCmArrows();
-  if (!_cmFieldBase) return;
-  _cmArrowMesh = _applyCmGridArrows(_cmFieldBase, vs);
-  updateCmVisibility();
-}
-
-function updateCmVisibility() {
-  if (!_cmArrowMesh) return;
-  const show = _currentView === "cylinder" && _currentDebugOpacity > 0.001;
-  _cmArrowMesh.visible = show;
-  if (_cmArrowMesh.material) _cmArrowMesh.material.opacity = _currentDebugOpacity;
-}
-
 function _cloneCoilField(field) {
   if (!field?.sites) return null;
   return {
@@ -578,31 +237,13 @@ function _cloneCoilField(field) {
   };
 }
 
-function refreshCoilArrows(vs = _sceneVoxelSize) {
-  if (_cuFieldBase) applyCuField(_cuFieldBase, vs);
-  if (_cvFieldBase) applyCvField(_cvFieldBase, vs);
-}
-
-function applyCuField(cu, vs, feaScale = 1.0) {
+function applyCuField(cu, vs) {
   clearCuArrows();
   if (!cu?.sites?.positions?.length) {
-    _cuObjects = [];
     console.warn("[Cu] no sites — restart python -u server.py");
     return;
   }
-  [_cuArrowMesh, _cuArrowMeshBehind] = _applyCurrentArrows(cu, vs, CU_ARROW_MAX, 2, "Cu", feaScale);
-  _cuObjects = cu.objects ?? [];
-}
-
-function applyCvField(cv, vs, feaScale = 1.0) {
-  clearCvArrows();
-  if (!cv?.sites?.positions?.length) {
-    _cvObjects = [];
-    console.warn("[Cv] no sites — restart python -u server.py");
-    return;
-  }
-  [_cvArrowMesh, _cvArrowMeshBehind] = _applyCurrentArrows(cv, vs, CV_ARROW_MAX, 2, "Cv", feaScale);
-  _cvObjects = cv.objects ?? [];
+  [_cuArrowMesh, _cuArrowMeshBehind] = _applyCurrentArrows(cu, vs, CU_ARROW_MAX, 2, "Cu");
 }
 
 // ─── Cube envelope outline (Ou only; Ho removed) ────────────────────────────────
@@ -658,13 +299,9 @@ function applyOuOpacityFromSlider() {
 // ─── View visibility (opacity-driven) ─────────────────────────────────────────
 function applyView() {
   const isCyl = _currentView === "cylinder";
+  if (_motion) _motion.setVisible(_currentView === "motion");
   const parts = _partsOpacity > 0.001;
-  voxelMesh.visible  = isCyl && parts && voxelMesh.count > 0;
-  capMesh.visible    = isCyl && parts && capMesh.count > 0;
-  plateMesh.visible  = isCyl && parts && plateMesh.count > 0;
-  hsMesh.visible     = isCyl && parts && hsMesh.count > 0;
   if (_ngSteelGroup) _ngSteelGroup.visible = isCyl && parts;
-  gmMesh.visible     = isCyl && _metalOpacity > 0.001 && gmMesh.count > 0;
   if (_cuArrowMesh) {
     const show = isCyl && _currentOpacity > 0.001;
     _cuArrowMesh.visible = show;
@@ -674,152 +311,10 @@ function applyView() {
     _cuArrowMeshBehind.visible = isCyl && _currentOpacity > 0.001 && _partsOpacity < 0.001;
     if (_cuArrowMeshBehind.material) _cuArrowMeshBehind.material.opacity = _currentOpacity * 0.35;
   }
-  if (_cvArrowMesh) {
-    const show = isCyl && _currentOpacity > 0.001;
-    _cvArrowMesh.visible = show;
-    if (_cvArrowMesh.material) _cvArrowMesh.material.opacity = _currentOpacity;
-  }
-  if (_cvArrowMeshBehind) {
-    _cvArrowMeshBehind.visible = isCyl && _currentOpacity > 0.001 && _partsOpacity < 0.001;
-    if (_cvArrowMeshBehind.material) _cvArrowMeshBehind.material.opacity = _currentOpacity * 0.35;
-  }
-  updateCmVisibility();
   applyBlineVisibility();
+  applyBsurfVisibility();
   applyGridOpacity();
   applyOuOpacityFromSlider();
-
-  const isSpin = _currentView === "spinning_cubes";
-  cubeModules.forEach(m => { m.mesh.visible = isSpin; });
-  ground.visible = isSpin;
-  grid.visible   = isSpin;
-}
-
-// ─── Apply voxel scene from Python ────────────────────────────────────────────
-function applyVoxelScene(data) {
-  clearNgMesh();
-  _hasVoxelScene = true;
-  const vs = data.voxel_size;
-  _sceneVoxelSize = vs;
-
-  _posCache.cyl = data.cylinders.positions;
-  _posCache.cap = data.caps.positions;
-  _posCache.pl  = data.plates?.positions ?? null;
-  _posCache.hs  = data.hs?.positions ?? null;
-  _posCache.gm  = data.fea_grid?.metal?.positions ?? null;
-
-  const cc = data.cylinders.color;
-  voxelMat.color.setRGB(cc[0], cc[1], cc[2]);
-  _cylObjects = data.cylinders.objects;
-
-  const cc2 = data.caps.color;
-  capMat.color.setRGB(cc2[0], cc2[1], cc2[2]);
-  _capObjects = data.caps.objects;
-
-  if (data.plates) {
-    const pc = data.plates.color;
-    plateMat.color.setRGB(pc[0], pc[1], pc[2]);
-    _plateObjects = data.plates.objects;
-  } else {
-    _plateObjects = [];
-  }
-
-  if (data.hs) {
-    const hc = data.hs.color;
-    hsMat.color.setRGB(hc[0], hc[1], hc[2]);
-    _hsObjects = data.hs.objects;
-  } else {
-    _hsObjects = [];
-  }
-
-  if (data.fea_grid?.metal?.positions?.length) {
-    const gc = data.fea_grid.color ?? [0.35, 0.85, 0.45];
-    gmMat.color.setRGB(gc[0], gc[1], gc[2]);
-  }
-
-  refreshVoxelMeshes();
-
-  if (data.fea_grid?.metal?.cell_count) {
-    if (gmMesh.count < data.fea_grid.metal.cell_count) {
-      console.warn(
-        `[Gm] showing ${gmMesh.count.toLocaleString()} / ${data.fea_grid.metal.cell_count.toLocaleString()} union cells (raise GM_CAPACITY)`
-      );
-    } else if (_posCache.gm) {
-      console.info(
-        `[Gm] ${gmMesh.count.toLocaleString()} union metal cells (raw ${data.fea_grid.metal.sources?.raw_total?.toLocaleString() ?? "?"})`
-      );
-    }
-  }
-
-  _coilWeights = data.coil?.weights ?? data.frame_config?.coil_weights ?? null;
-  _setCoilPalette(data.coil?.color_positive, data.coil?.color_negative);
-  _feaRunning = false;
-
-  if (data.cu) {
-    _cuFieldBase = _cloneCoilField(data.cu);
-    applyCuField(data.cu, vs);
-  } else {
-    _cuFieldBase = null;
-    clearCuArrows();
-  }
-
-  if (data.cv) {
-    _cvFieldBase = _cloneCoilField(data.cv);
-    applyCvField(data.cv, vs);
-  } else {
-    _cvFieldBase = null;
-    clearCvArrows();
-  }
-
-  const coilCells = data.fea_grid?.cells?.coil ?? data.fea_grid?.cells?.copper;
-  if (coilCells?.positions?.length && coilCells.J?.length) {
-    _cmFieldBase = {
-      positions: coilCells.positions,
-      J: coilCells.J,
-      weight: coilCells.weight ?? [],
-      color_positive: data.cu?.color_positive ?? data.coil?.color_positive,
-      color_negative: data.cu?.color_negative ?? data.coil?.color_negative,
-    };
-    if (_currentDebugOpacity > 0.001) rebuildCmArrows(vs);
-  } else {
-    clearCmField();
-  }
-
-  _activeScene = data.scene_id ?? "frame";
-  _cubeCorners = data.frame_config?.cube_corners ?? null;
-  syncModeSelectFromState();
-
-  if (data.frame_config) buildOuOutline(data.frame_config);
-  applyView();
-  applyOpacityFromSlider();
-  applyMetalOpacityFromSlider();
-  applyCurrentOpacityFromSlider();
-  applyCurrentDebugOpacityFromSlider();
-  scheduleResize();
-
-  const status = document.getElementById("solve-status");
-  if (status && _currentView === "cylinder") {
-    const n = voxelMesh.count + capMesh.count;
-    status.textContent = n > 0 ? `${n.toLocaleString()} voxels · ${_activeScene}` : "";
-    status.style.color = "#8b949e";
-  }
-}
-
-// ─── Apply spinning-cubes frame from Python ───────────────────────────────────
-function applyFrame(data) {
-  if (!data.cubes) return;
-  data.cubes.forEach((c, i) => {
-    if (i >= cubeModules.length) return;
-    const m = cubeModules[i];
-    m.mesh.position.fromArray(c.pos);
-    m.mesh.quaternion.fromArray(c.quat);   // [qx, qy, qz, qw]
-    if (c.coils) {
-      c.coils.forEach((faceCoils, fi) => {
-        faceCoils.forEach((p, ci) => {
-          m.coilData[fi][ci].power = (p + 1) / 2;  // remap [-1,1] -> [0,1]
-        });
-      });
-    }
-  });
 }
 
 // ─── B-field lines ──────────────────────────────────────────────────────────
@@ -873,6 +368,21 @@ function applyBfieldLines(data) {
   scene.add(_blineGroup);
   applyBlineVisibility();
 
+  // Cache the sampled |B| grid and (re)build the force-metric isosurface.
+  if (data.field?.b?.length) {
+    _field = {
+      n: data.field.n,
+      origin: data.field.origin,
+      step: data.field.step,
+      b: Float32Array.from(data.field.b),
+      b_max: data.field.b_max,
+    };
+  } else {
+    _field = null;
+  }
+  rebuildBsurf();
+  updateBsurfReadout();
+
   const meta = data.meta ?? {};
   const status = document.getElementById("solve-status");
   if (status) {
@@ -882,27 +392,114 @@ function applyBfieldLines(data) {
     status.textContent = `${meta.n_lines ?? lines.length} lines · max|B|=${maxB} T${mu}${scene}`;
     status.style.color = "#3fb950";
   }
-  const btn = document.getElementById("solve-btn");
-  if (btn) { btn.disabled = false; }
+  setBusyFlag("solve", false);
 }
 
 function applyBfieldStatus(data) {
   const status = document.getElementById("solve-status");
-  const btn = document.getElementById("solve-btn");
   if (data.state === "solving") {
     if (status) { status.textContent = "Solving B field…"; status.style.color = "#d29922"; }
-    if (btn) btn.disabled = true;
+    setBusyFlag("solve", true);
   } else if (data.state === "error") {
     if (status) { status.textContent = `Error: ${data.message ?? "solve failed"}`; status.style.color = "#f85149"; }
-    if (btn) btn.disabled = false;
+    setBusyFlag("solve", false);
   }
 }
 
 function applyBlineVisibility() {
   if (!_blineGroup) return;
   const op = _blineOpacity();
-  _blineGroup.visible = _currentView === "cylinder" && op > 0.001;
+  // B lines yield to the force-metric surface when it is active.
+  const bsurfOn = _bsurfLevel() != null;
+  _blineGroup.visible = _currentView === "cylinder" && op > 0.001 && !bsurfOn;
   _blineGroup.traverse(o => { if (o.material) o.material.opacity = op; });
+}
+
+// ─── Force-metric isosurface (B surf slider) ──────────────────────────────────
+// The metric is the magnetic pressure p = B²/(2μ0) — the attractive force
+// density between two equal fields facing each other. It is monotonic in |B|,
+// so we threshold the sampled |B| grid directly and label the level as force.
+const _MU0 = 4 * Math.PI * 1e-7;
+let _field = null;       // { n, origin, step, b:Float32Array, b_max }
+let _bsurfMesh = null;
+let _bsurfRaf = 0;
+
+function clearBsurf() {
+  if (_bsurfMesh) {
+    scene.remove(_bsurfMesh);
+    _bsurfMesh.geometry?.dispose();
+    _bsurfMesh.material?.dispose();
+    _bsurfMesh = null;
+  }
+}
+
+// Slider t∈[0,1] → |B| isolevel, logarithmic in force from a fixed 0.1 Pa floor
+// up to b_max. t≈0 is "off". The floor B = √(2μ0·p) ≈ 0.5 mT gives a faint,
+// far-reaching "area of influence" surface. Returns null when off / no field.
+const _BSURF_MIN_PA = 0.1;
+function _bsurfLevel() {
+  if (!_field || !(_field.b_max > 0)) return null;
+  const t = parseFloat(document.getElementById("bsurf-slider")?.value ?? 0);
+  if (t <= 0.001) return null;
+  const bMax = _field.b_max;
+  const bMin = Math.min(Math.sqrt(2 * _MU0 * _BSURF_MIN_PA), bMax * 0.5);
+  return bMin * Math.pow(bMax / bMin, t);   // t→0: bMin (0.1 Pa), t=1: bMax
+}
+
+function _fmtForce(pa) {
+  if (pa >= 1e6) return `${(pa / 1e6).toFixed(2)}MPa`;
+  if (pa >= 1e3) return `${(pa / 1e3).toFixed(0)}kPa`;
+  return `${pa.toFixed(0)}Pa`;
+}
+
+function updateBsurfReadout() {
+  const el = document.getElementById("bsurf-val");
+  if (!el) return;
+  const bLevel = _bsurfLevel();
+  if (bLevel == null) { el.textContent = "off"; return; }
+  el.textContent = _fmtForce((bLevel * bLevel) / (2 * _MU0));
+}
+
+function rebuildBsurf() {
+  clearBsurf();
+  const bLevel = _bsurfLevel();
+  if (bLevel == null || !_field) return;
+
+  const verts = extractIsosurface(_field.b, _field.n, bLevel, _field.origin, _field.step);
+  if (!verts.length) return;
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(verts, 3));
+  geo.computeVertexNormals();
+
+  // Colour by the level on the same blue→orange scale the B lines use.
+  const frac = Math.sqrt(Math.min(1, bLevel / _field.b_max));
+  const col = _blineColorLo.clone().lerp(_blineColorHi, frac);
+  const mat = new THREE.MeshStandardMaterial({
+    color: col, metalness: 0.0, roughness: 0.5,
+    transparent: true, opacity: _blineOpacity(),
+    side: THREE.DoubleSide, depthWrite: false,
+  });
+  _bsurfMesh = new THREE.Mesh(geo, mat);
+  _bsurfMesh.renderOrder = 2;
+  scene.add(_bsurfMesh);
+  applyBsurfVisibility();
+  applyBlineVisibility();
+}
+
+// Coalesce rapid slider input into one rebuild per frame.
+function scheduleBsurf() {
+  updateBsurfReadout();
+  applyBlineVisibility();   // toggle lines off/on as the surface turns on/off
+  if (_bsurfRaf) return;
+  _bsurfRaf = requestAnimationFrame(() => { _bsurfRaf = 0; rebuildBsurf(); });
+}
+
+function applyBsurfVisibility() {
+  if (!_bsurfMesh) return;
+  const op = _blineOpacity();
+  _bsurfMesh.visible = _currentView === "cylinder" && op > 0.001;
+  if (_bsurfMesh.material) _bsurfMesh.material.opacity = op;
 }
 
 // ─── NGSolve / Netgen surface mesh (fea_mesh payload) ──────────────────────────
@@ -924,13 +521,11 @@ function clearNgMesh() {
 
 function applyFeaMesh(data) {
   clearNgMesh();
-  // Clear voxel geometry and existing arrows so the mesh scene starts clean.
-  _posCache.cyl = _posCache.cap = _posCache.pl = _posCache.hs = _posCache.gm = null;
-  refreshVoxelMeshes();
   clearCuArrows();
-  clearCvArrows();
-  clearCmField();
   clearBlines();
+  clearBsurf();
+  _field = null;
+  updateBsurfReadout();
 
   const verts = data.vertices ?? [];
   _ngMeshGroup  = new THREE.Group();   // air box wireframe (grid slider)
@@ -1002,8 +597,7 @@ function applyFeaMesh(data) {
   scene.add(_ngSteelGroup);
   scene.add(_ngMeshGroup);
 
-  // Wire up coil current arrows (same Cu-arrow scheme as voxel scenes).
-  _feaRunning = false;
+  // Coil current arrows
   const vs = data.voxel_size ?? 0.15;
   _sceneVoxelSize = vs;
   if (data.cu?.sites?.positions?.length) {
@@ -1013,7 +607,7 @@ function applyFeaMesh(data) {
     _cuFieldBase = null;
   }
 
-  _hasVoxelScene = true;
+  _hasScene = true;
   _activeScene = data.scene_id ?? "1dipole";
   _cubeCorners = data.frame_config?.cube_corners ?? null;
   if (data.frame_config) buildOuOutline(data.frame_config);
@@ -1024,17 +618,74 @@ function applyFeaMesh(data) {
   scheduleResize();
 
   const meta = data.meta ?? {};
+  if (meta.extended_grid != null) {
+    const ext = document.getElementById("extgrid-checkbox");
+    if (ext) ext.checked = !!meta.extended_grid;
+  }
+  applyConfigUi(meta.config);
+  _driveBase = (meta.total_power_W != null || meta.total_mass_g != null)
+    ? { total_power_W: meta.total_power_W ?? 0,
+        total_mass_g: meta.total_mass_g ?? 0,
+        n_active_coils: meta.n_active_coils ?? 0 }
+    : null;
+  updateDriveReadout();
   const status = document.getElementById("solve-status");
-  if (status && _currentView === "cylinder") {
+  if (status && _currentView === "cylinder" && !_busyFlags.has("build")) {
     if (meta.error) {
       status.textContent = `Mesh error: ${meta.error}`;
       status.style.color = "#f85149";
     } else {
+      const box = meta.air_box_mm != null ? ` · box ${meta.air_box_mm}mm` : "";
       status.textContent =
-        `${(meta.n_tris ?? 0).toLocaleString()} tris · ${(meta.n_points ?? 0).toLocaleString()} pts · maxh ${meta.maxh_mm}mm`;
+        `${(meta.n_tris ?? 0).toLocaleString()} tris · ${(meta.n_points ?? 0).toLocaleString()} pts · maxh ${meta.maxh_mm}mm${box}`;
       status.style.color = "#3fb950";
     }
   }
+  setBusyFlag("mesh", false);   // mesh ready — unlock unless solve/build still running
+}
+
+// Excitation (config) changed: geometry is identical, so we only refresh the
+// coil arrows, frame polarity and drive totals — no mesh rebuild. Any prior
+// B-field solve no longer matches the new excitation, so it is cleared.
+function applyCoilUpdate(data) {
+  clearCuArrows();
+  clearBlines();
+  clearBsurf();
+  _field = null;
+  updateBsurfReadout();
+
+  const vs = data.voxel_size ?? _sceneVoxelSize ?? 0.15;
+  _sceneVoxelSize = vs;
+  if (data.cu?.sites?.positions?.length) {
+    _cuFieldBase = _cloneCoilField(data.cu);
+    applyCuField(data.cu, vs);
+  } else {
+    _cuFieldBase = null;
+  }
+  if (data.frame_config) {
+    _cubeCorners = data.frame_config.cube_corners ?? _cubeCorners;
+    buildOuOutline(data.frame_config);
+  }
+
+  const meta = data.meta ?? {};
+  applyConfigUi(meta.config);
+  if (meta.total_power_W != null) {
+    _driveBase = {
+      total_power_W: meta.total_power_W ?? 0,
+      total_mass_g: _driveBase?.total_mass_g ?? 0,   // mass is config-independent
+      n_active_coils: meta.n_active_coils ?? 0,
+    };
+  }
+  updateDriveReadout();
+  applyView();
+  applyOpacityFromSlider();
+  applyCurrentOpacityFromSlider();
+  const status = document.getElementById("solve-status");
+  if (status && _currentView === "cylinder") {
+    status.textContent = `config: ${meta.config ?? "?"} · solve to update B`;
+    status.style.color = "#8b949e";
+  }
+  // Config is instant (arrows only) — never clears mesh/solve/build busy flags.
 }
 
 function applyGridOpacity() {
@@ -1067,13 +718,36 @@ function _strength() {
 }
 function _fmtStrength(s) { return s >= 1 ? s.toFixed(2) : s.toFixed(3); }
 
+function _fmtW(w) {
+  // Watts: integer up to ~10 kW, then "12.3kW".
+  return Math.abs(w) >= 1e4 ? `${(w / 1e3).toFixed(1)}kW` : `${Math.round(w)}W`;
+}
+
+// Drive readout on the Sat line: ohmic power (scales with Strength²) + total
+// mass (fixed). Power base is at 1×; mass is geometry-only.
+function updateDriveReadout() {
+  const el = document.getElementById("drive-readout");
+  if (!el) return;
+  if (!_driveBase) {
+    el.textContent = "";
+    return;
+  }
+  const s = _strength();
+  const pow = (_driveBase.total_power_W ?? 0) * s * s;
+  const mass = _driveBase.total_mass_g ?? 0;
+  const parts = [];
+  if (_driveBase.n_active_coils > 0) parts.push(_fmtW(pow));
+  if (mass > 0) parts.push(`${Math.round(mass)}g`);
+  el.textContent = parts.join(" · ");
+  el.style.color = "#8b949e";
+}
+
 function sendSolveBfield() {
   if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
   const strength = _strength();
   const mu_r = _blineMu();
   const saturate = document.getElementById("sat-checkbox")?.checked ?? true;
-  const btn = document.getElementById("solve-btn");
-  if (btn) btn.disabled = true;
+  setBusyFlag("solve", true);
   const status = document.getElementById("solve-status");
   if (status) {
     status.textContent = `Solving B field (μ=${mu_r}, ${strength.toFixed(2)}×${saturate ? ", sat" : ""})…`;
@@ -1084,35 +758,18 @@ function sendSolveBfield() {
 
 function sendUIState() {
   if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
-  const spin     = parseFloat(document.getElementById("spin-slider")?.value     ?? 0.8);
-  const damping  = parseFloat(document.getElementById("damp-slider")?.value     ?? 0.985);
-  const strength = _strength();
-  _ws.send(JSON.stringify({ type: "ui_state", spin, damping, strength }));
-  if (_feaRunning) refreshCoilArrows(_sceneVoxelSize);
-}
-
-function sendFeaStart() {
-  if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
-  const strength = _strength();
-  _feaRunning = true;
-  _ws.send(JSON.stringify({ type: "fea_start", strength }));
-}
-
-function sendView(view) {
-  if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
-  _ws.send(JSON.stringify({ type: "view", view }));
+  _ws.send(JSON.stringify({ type: "ui_state", strength: _strength() }));
 }
 
 function sendScene(sceneId) {
   if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
   clearBlines();
-  // Scene geometry uses coil_init weights as-is; Strength slider applies via fea_start only.
+  setBusyFlag("mesh", true);   // mesh rebuild in flight — lock out solves/builds
   _ws.send(JSON.stringify({ type: "scene", scene: sceneId }));
 }
 
 function currentModeId() {
-  if (_currentView === "spinning_cubes") return "spinning_cubes";
-  return `cylinder:${_activeScene}`;
+  return _currentModeId;
 }
 
 function syncModeSelectFromState() {
@@ -1120,7 +777,67 @@ function syncModeSelectFromState() {
   if (!sel) return;
   const id = currentModeId();
   if (sel.value !== id) sel.value = id;
-  updateControlSections();
+  applyConfigUi();
+}
+
+// Read the per-box dropdowns + power slider into MotionStage body states.
+function motionStatesFromUI() {
+  const read = (suffix) => ({
+    config: document.getElementById(`cfg${suffix}`)?.value ?? "face",
+    axis:   document.getElementById(`axis${suffix}`)?.value ?? "+Z",
+    roll:   document.getElementById(`roll${suffix}`)?.value ?? "N",
+    level:  parseFloat(document.getElementById(`pow${suffix}`)?.value ?? "1"),
+  });
+  return [
+    { ...read("A"), offset: [-MOTION_OFFSET, 0, 0] },
+    { ...read("B"), offset: [ MOTION_OFFSET, 0, 0] },
+  ];
+}
+
+// Power readout: signed percentage of full power (− = reversed polarity).
+function updateMotionPowReadout(suffix) {
+  const el = document.getElementById(`pow${suffix}-val`);
+  if (!el) return;
+  const d = levelToDrive(parseFloat(document.getElementById(`pow${suffix}`)?.value ?? "1"));
+  const pct = Math.round(d.powerPct);
+  el.textContent = `${d.polarity < 0 ? "\u2212" : "+"}${pct}%`;
+}
+
+function refreshMotion() {
+  if (!_motion) _motion = new MotionStage(scene);
+  updateMotionPowReadout("A");
+  updateMotionPowReadout("B");
+  _motion.setBodies(motionStatesFromUI());
+  // Rebuild creates fresh body groups — re-apply the debug selection tint.
+  if (_selectedIdx >= 0 && _selectedIdx < _motion.bodies.length) {
+    _motion.highlight(_motion.bodies[_selectedIdx], true);
+  } else {
+    _selectedIdx = -1;
+  }
+  updateMotionSelReadout();
+}
+
+function enterMotionView() {
+  _currentView = "motion";
+  refreshMotion();
+  document.getElementById("controls")?.classList.add("view-motion");
+  applyView();
+  syncModeSelectFromState();
+  scheduleResize();
+}
+
+// The config dropdown only drives the 12-dipole scene; the others have a single
+// fixed excitation, so disable it elsewhere. `active` (when given) reflects the
+// config the server actually built.
+function applyConfigUi(active) {
+  const is12 = _activeScene === "12dipoles_ng";
+  const sel = document.getElementById("config-select");
+  if (sel) {
+    sel.disabled = !is12;
+    if (active && sel.value !== active) sel.value = active;
+  }
+  const btn = document.getElementById("build-fields-btn");
+  if (btn) btn.disabled = !is12;
 }
 
 function updateModeOptionLabels(scenes) {
@@ -1132,16 +849,6 @@ function updateModeOptionLabels(scenes) {
   }
 }
 
-function updateControlSections() {
-  const cyl = _currentView === "cylinder";
-  document.getElementById("cylinder-controls")?.classList.toggle("hidden", !cyl);
-  document.getElementById("spin-controls")?.classList.toggle("hidden", cyl);
-  const hint = document.getElementById("hint");
-  if (hint) hint.style.display = cyl ? "" : "none";
-  const hi = document.getElementById("hover-info");
-  if (hi && !cyl) hi.textContent = "";
-}
-
 function setLoadStatus(msg) {
   const status = document.getElementById("solve-status");
   if (!status || _currentView !== "cylinder") return;
@@ -1149,42 +856,38 @@ function setLoadStatus(msg) {
   status.style.color = "#d29922";
 }
 
-
 function applyMode(modeId) {
   const mode = MODE_OPTIONS.find(m => m.id === modeId) ?? MODE_OPTIONS[0];
-  const prevView  = _currentView;
-  const prevScene = _activeScene;
+  _currentModeId = mode.id;
+  const view = mode.view ?? "cylinder";
 
-  if (mode.view === "spinning_cubes") {
-    _currentView = "spinning_cubes";
-    sendView("spinning_cubes");
-    applyView();
-    updateControlSections();
-    syncModeSelectFromState();
+  // Motion view is fully client-side (no mesh build / solver). It just stages
+  // rounded cubes + north arrows; the camera/orbit controls keep working.
+  if (view === "motion") {
+    enterMotionView();
     return;
   }
 
+  const prevScene = _activeScene;
   _currentView = "cylinder";
-  const scene = mode.scene ?? "frame";
-  const sceneChanged = scene !== prevScene;
+  selectMotionBody(-1);   // leaving motion view: drop any debug selection
+  document.getElementById("controls")?.classList.remove("view-motion");
+  if (_motion) _motion.setVisible(false);
 
-  // Only re-send the view when actually returning from another view. Sending it
-  // on every scene switch makes the server echo the OLD scene first, which
-  // reverts _activeScene/the dropdown mid-switch (looked like "switch twice").
-  if (prevView !== "cylinder") sendView("cylinder");
+  const sceneId = mode.scene ?? "1dipole";
+  const sceneChanged = sceneId !== prevScene;
 
   if (sceneChanged) {
-    _activeScene = scene;
-    _hasVoxelScene = false;
+    _activeScene = sceneId;
+    _hasScene = false;
     setLoadStatus(`Building ${mode.label}…`);
-    sendScene(scene);
-  } else if (!_hasVoxelScene) {
+    sendScene(sceneId);
+  } else if (!_hasScene) {
     setLoadStatus(`Building ${mode.label}…`);
-    sendScene(scene);
+    sendScene(sceneId);
   }
 
   applyView();
-  updateControlSections();
   syncModeSelectFromState();
   scheduleResize();
 }
@@ -1197,18 +900,23 @@ function connectWS() {
   });
   _ws.addEventListener("message", e => {
     const data = JSON.parse(e.data);
-    if      (data.type === "voxel_scene")   applyVoxelScene(data);
-    else if (data.type === "fea_mesh")      applyFeaMesh(data);
+    if      (data.type === "fea_mesh")     applyFeaMesh(data);
+    else if (data.type === "coil_update")  applyCoilUpdate(data);
     else if (data.type === "scene_list") {
       updateModeOptionLabels(data.scenes ?? []);
       if (data.active) {
         _activeScene = data.active;
-        syncModeSelectFromState();
+        // Don't let a server scene broadcast override the motion-view selection.
+        if (_currentView === "cylinder") {
+          _currentModeId = `cylinder:${_activeScene}`;
+          syncModeSelectFromState();
+        }
       }
     }
-    else if (data.type === "frame")         applyFrame(data);
     else if (data.type === "bfield_lines")  applyBfieldLines(data);
     else if (data.type === "bfield_status") applyBfieldStatus(data);
+    else if (data.type === "build_fields_status")   applyBuildFieldsStatus(data);
+    else if (data.type === "build_fields_progress") applyBuildFieldsProgress(data);
   });
   _ws.addEventListener("close", () => setTimeout(connectWS, 2000));
 }
@@ -1220,7 +928,7 @@ const _raycaster = new THREE.Raycaster();
 const _mouse     = new THREE.Vector2();
 const _hoverPt   = new THREE.Vector3();
 const _facePlane = new THREE.Plane();
-// Must match geometry_ids.FACE_CLOCKWISE (+Z, -Z, +X, -X, +Y, -Y)
+// Cube face corner order (+Z, -Z, +X, -X, +Y, -Y)
 const _FACE_CORNERS = [
   [1, 2, 3, 4], [5, 6, 7, 8], [1, 2, 6, 5], [3, 4, 8, 7], [1, 4, 8, 5], [3, 2, 7, 6],
 ];
@@ -1305,21 +1013,135 @@ function _raycastCubePoint(ray) {
 
 window.addEventListener("mousemove", e => {
   const hi = document.getElementById("hover-info");
-  if (!hi || _currentView !== "cylinder" || !_hasCorners()) {
-    if (hi) hi.textContent = "";
-    return;
-  }
+  if (!hi) return;
+  if (_currentView !== "cylinder") return;   // motion view owns hover-info (debug readout)
+  if (!_hasCorners()) { hi.textContent = ""; return; }
   _setPointerNdc(e.clientX, e.clientY);
   _raycaster.setFromCamera(_mouse, camera);
-  const meshes = [voxelMesh, capMesh, plateMesh, hsMesh, gmMesh]
-    .filter(m => m.visible && m.count > 0);
   let pt = null;
-  if (meshes.length) {
-    const hits = _raycaster.intersectObjects(meshes, false);
+  if (_ngSteelGroup?.visible) {
+    const hits = _raycaster.intersectObject(_ngSteelGroup, true);
     if (hits.length) pt = hits[0].point;
   }
   if (!pt) pt = _raycastCubePoint(_raycaster.ray);
   hi.textContent = pt ? _cornerFromPoint(pt) : "";
+});
+
+// ─── Motion-view debug: double-click select a cube, drag to pose it ────────────
+// Double-click a cube → it tints and orbit rotate/pan are remapped to act on
+// THAT body (left = rotate, right = pan). Double-click empty space → deselect
+// and the camera controls return. Hand-placed poses persist across config /
+// power UI changes, so this doubles as a quick way to lay out the starting
+// coordinates of two (or more) cubes for later animation.
+let _dragBtn = -1;
+let _lastX = 0, _lastY = 0;
+const _camRight = new THREE.Vector3();
+const _camUp    = new THREE.Vector3();
+const _camFwd   = new THREE.Vector3();
+const _dragQuat = new THREE.Quaternion();
+
+function _selectedBody() {
+  return _selectedIdx >= 0 && _motion && _selectedIdx < _motion.bodies.length
+    ? _motion.bodies[_selectedIdx] : null;
+}
+
+function updateMotionSelReadout() {
+  const hi = document.getElementById("hover-info");
+  if (!hi) return;
+  const b = _selectedBody();
+  if (!b) { if (_currentView === "motion") hi.textContent = ""; return; }
+  const p = b.position;
+  const e = new THREE.Euler().setFromQuaternion(b.quaternion, "XYZ");
+  const d = v => THREE.MathUtils.radToDeg(v).toFixed(0);
+  hi.textContent =
+    `box ${_selectedIdx === 0 ? "A" : _selectedIdx === 1 ? "B" : _selectedIdx} · ` +
+    `pos(${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}) · ` +
+    `rot(${d(e.x)}°, ${d(e.y)}°, ${d(e.z)}°)`;
+}
+
+function selectMotionBody(idx) {
+  if (_motion && _selectedIdx >= 0 && _selectedIdx < _motion.bodies.length) {
+    _motion.highlight(_motion.bodies[_selectedIdx], false);
+  }
+  _selectedIdx = (idx != null && idx >= 0) ? idx : -1;
+  const picked = _selectedBody();
+  if (picked) {
+    _motion.highlight(picked, true);
+    controls.enableRotate = false;   // orbit rotate/pan now drive the body
+    controls.enablePan    = false;
+  } else {
+    controls.enableRotate = true;
+    controls.enablePan    = true;
+  }
+  updateMotionSelReadout();
+}
+
+function _pickMotionBody(clientX, clientY) {
+  if (!_motion?.bodies?.length) return -1;
+  _setPointerNdc(clientX, clientY);
+  _raycaster.setFromCamera(_mouse, camera);
+  const hits = _raycaster.intersectObjects(_motion.bodies, true);
+  if (!hits.length) return -1;
+  let o = hits[0].object;
+  while (o && !_motion.bodies.includes(o)) o = o.parent;
+  return o ? _motion.bodies.indexOf(o) : -1;
+}
+
+function _rotateSelected(dx, dy) {
+  const b = _selectedBody();
+  if (!b) return;
+  camera.matrixWorld.extractBasis(_camRight, _camUp, _camFwd);
+  const speed = 0.01;
+  _dragQuat.setFromAxisAngle(_camUp, dx * speed);
+  b.quaternion.premultiply(_dragQuat);
+  _dragQuat.setFromAxisAngle(_camRight, dy * speed);
+  b.quaternion.premultiply(_dragQuat);
+  _motion.markMoved(_selectedIdx);
+  updateMotionSelReadout();
+}
+
+function _panSelected(dx, dy) {
+  const b = _selectedBody();
+  if (!b) return;
+  camera.matrixWorld.extractBasis(_camRight, _camUp, _camFwd);
+  // world units per screen pixel at the body's depth
+  const dist = camera.position.distanceTo(b.position);
+  const vh   = (viewport ?? renderer.domElement).clientHeight || 1;
+  const wpp  = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * dist / vh;
+  b.position.addScaledVector(_camRight,  dx * wpp);
+  b.position.addScaledVector(_camUp,    -dy * wpp);
+  _motion.markMoved(_selectedIdx);
+  updateMotionSelReadout();
+}
+
+renderer.domElement.addEventListener("dblclick", e => {
+  if (_currentView !== "motion") return;
+  selectMotionBody(_pickMotionBody(e.clientX, e.clientY));
+});
+
+renderer.domElement.addEventListener("mousedown", e => {
+  if (_currentView !== "motion" || !_selectedBody()) return;
+  if (e.button !== 0 && e.button !== 2) return;
+  _dragBtn = e.button;
+  _lastX = e.clientX;
+  _lastY = e.clientY;
+  e.preventDefault();
+});
+
+window.addEventListener("mousemove", e => {
+  if (_dragBtn < 0 || !_selectedBody()) return;
+  const dx = e.clientX - _lastX;
+  const dy = e.clientY - _lastY;
+  _lastX = e.clientX;
+  _lastY = e.clientY;
+  if (_dragBtn === 0) _rotateSelected(dx, dy);
+  else if (_dragBtn === 2) _panSelected(dx, dy);
+});
+
+window.addEventListener("mouseup", () => { _dragBtn = -1; });
+
+renderer.domElement.addEventListener("contextmenu", e => {
+  if (_currentView === "motion" && _selectedBody()) e.preventDefault();
 });
 
 // ─── UI controls ──────────────────────────────────────────────────────────────
@@ -1334,18 +1156,16 @@ function bindSlider(id, valId, decimals, cb) {
   });
 }
 
-bindSlider("spin-slider",     "spin-val",     1, () => sendUIState());
-bindSlider("damp-slider",     "damp-val",     3, () => sendUIState());
 const _strengthSlider = document.getElementById("strength-slider");
 if (_strengthSlider) {
   const showStrength = () => {
     const val = document.getElementById("strength-val");
     if (val) val.textContent = _fmtStrength(_strength());
+    updateDriveReadout();
   };
   _strengthSlider.addEventListener("input", () => {
     showStrength();
     sendUIState();
-    sendFeaStart();
   });
   showStrength();
 }
@@ -1358,13 +1178,6 @@ function applyOpacityFromSlider() {
   _partsOpacity = parseFloat(_opSlider.value);
   const opV = document.getElementById("opacity-val");
   if (opV) opV.textContent = _partsOpacity.toFixed(2);
-  voxelMat.opacity  = _partsOpacity;
-  capMat.opacity    = _partsOpacity;
-  plateMat.opacity  = _partsOpacity;
-  hsMat.opacity     = _partsOpacity;
-  // Steel mesh in the NGSolve scene shares the parts opacity slider.
-  // depthWrite stays true always — the two-pass arrow system relies on the
-  // steel surface being in the depth buffer at any opacity value.
   if (_ngSteelGroup) {
     _ngSteelGroup.traverse(o => {
       if (o.isMesh && o.material) {
@@ -1382,7 +1195,6 @@ function applyMetalOpacityFromSlider() {
   _metalOpacity = parseFloat(_metalOpSlider.value);
   const opV = document.getElementById("metal-opacity-val");
   if (opV) opV.textContent = _metalOpacity.toFixed(2);
-  gmMat.opacity = _metalOpacity;
   applyGridOpacity();
   applyView();
 }
@@ -1393,18 +1205,6 @@ function applyCurrentOpacityFromSlider() {
   _currentOpacity = parseFloat(sl.value);
   const opV = document.getElementById("current-opacity-val");
   if (opV) opV.textContent = _currentOpacity.toFixed(2);
-  applyView();
-}
-
-function applyCurrentDebugOpacityFromSlider() {
-  const sl = document.getElementById("current-debug-opacity-slider");
-  if (!sl) return;
-  _currentDebugOpacity = parseFloat(sl.value);
-  const opV = document.getElementById("current-debug-opacity-val");
-  if (opV) opV.textContent = _currentDebugOpacity.toFixed(2);
-  if (_currentDebugOpacity > 0.001 && _cmFieldBase && !_cmArrowMesh) {
-    rebuildCmArrows(_sceneVoxelSize);
-  }
   applyView();
 }
 
@@ -1434,36 +1234,149 @@ if (_curOpSlider) {
   _curOpSlider.addEventListener("input", applyCurrentOpacityFromSlider);
   applyCurrentOpacityFromSlider();
 }
-const _curDbgSlider = document.getElementById("current-debug-opacity-slider");
-if (_curDbgSlider) {
-  _curDbgSlider.addEventListener("input", applyCurrentDebugOpacityFromSlider);
-  applyCurrentDebugOpacityFromSlider();
-}
-
-const _peelSlider = document.getElementById("peel-slider");
-function applyPeelFromSlider() {
-  if (!_peelSlider) return;
-  _peelCamDist = parseFloat(_peelSlider.value);
-  const peelV = document.getElementById("peel-val");
-  if (peelV) peelV.textContent = _peelCamDist.toFixed(2);
-  refreshVoxelMeshes();
-}
-if (_peelSlider) {
-  _peelSlider.addEventListener("input", applyPeelFromSlider);
-  applyPeelFromSlider();
-}
-
 const _modeSelect = document.getElementById("mode-select");
 if (_modeSelect) {
   _modeSelect.addEventListener("change", () => applyMode(_modeSelect.value));
 }
-updateControlSections();
 
-document.getElementById("restart-btn")?.addEventListener("click", () => {
-  sendUIState();
-  sendFeaStart();
-});
+// Per-box motion dropdowns: rebuild the staged bodies (client-side, instant).
+for (const id of ["cfgA", "axisA", "rollA", "cfgB", "axisB", "rollB"]) {
+  document.getElementById(id)?.addEventListener("change", () => {
+    if (_currentView === "motion") refreshMotion();
+  });
+}
+// Power/polarity sliders rebuild live while dragging.
+for (const id of ["powA", "powB"]) {
+  document.getElementById(id)?.addEventListener("input", () => {
+    if (_currentView === "motion") refreshMotion();
+  });
+}
+
+document.getElementById("restart-btn")?.addEventListener("click", () => sendUIState());
 document.getElementById("solve-btn")?.addEventListener("click", () => sendSolveBfield());
+
+const _extGridCheckbox = document.getElementById("extgrid-checkbox");
+if (_extGridCheckbox) {
+  _extGridCheckbox.addEventListener("change", () => {
+    if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
+    setLoadStatus(`Rebuilding mesh (${_extGridCheckbox.checked ? "extended" : "normal"} grid)…`);
+    setBusyFlag("mesh", true);
+    _ws.send(JSON.stringify({ type: "extended_grid", on: _extGridCheckbox.checked }));
+  });
+}
+
+const _configSelect = document.getElementById("config-select");
+if (_configSelect) {
+  _configSelect.addEventListener("change", () => {
+    if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
+    setLoadStatus(`Switching to ${_configSelect.value} config…`);
+    _ws.send(JSON.stringify({ type: "config", config: _configSelect.value }));
+  });
+}
+
+// Force the Strength slider to 1× (centre of the log slider, t=0.5) and refresh.
+function setStrengthToOne() {
+  const sl = document.getElementById("strength-slider");
+  if (!sl) return;
+  sl.value = 0.5;
+  const val = document.getElementById("strength-val");
+  if (val) val.textContent = _fmtStrength(_strength());
+  updateDriveReadout();
+  sendUIState();
+}
+
+const _buildFieldsBtn = document.getElementById("build-fields-btn");
+if (_buildFieldsBtn) {
+  _buildFieldsBtn.addEventListener("click", () => {
+    if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
+    // The button owns these preconditions: extended grid ON + strength 1×.
+    const ext = document.getElementById("extgrid-checkbox");
+    if (ext) ext.checked = true;
+    setStrengthToOne();
+    setBusyFlag("build", true);
+    _setBuildStatus("Build: starting…");
+    _ws.send(JSON.stringify({ type: "build_fields" }));
+  });
+}
+
+function _setBuildStatus(text, color = "#d29922") {
+  // Share the main solve-status line (under the Solve button).
+  const el = document.getElementById("solve-status");
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = color;
+}
+
+// Track concurrent operations independently so a fast config switch (arrows only)
+// cannot unlock buttons while a mesh rebuild or build sweep is still running.
+const _busyFlags = new Set();
+
+function setBusyFlag(name, on) {
+  if (on) _busyFlags.add(name);
+  else _busyFlags.delete(name);
+  setButtonsBusy(_busyFlags.size > 0);
+}
+
+// Gray out every action button while ANY tracked operation is running, then
+// restore them when idle. The build button is additionally gated to the
+// 12-dipole scene via applyConfigUi.
+function setButtonsBusy(busy) {
+  const solveBtn = document.getElementById("solve-btn");
+  const restartBtn = document.getElementById("restart-btn");
+  const buildBtn = document.getElementById("build-fields-btn");
+  const modeSel = document.getElementById("mode-select");
+  const cfgSel = document.getElementById("config-select");
+  if (busy) {
+    if (solveBtn) solveBtn.disabled = true;
+    if (restartBtn) restartBtn.disabled = true;
+    if (buildBtn) buildBtn.disabled = true;
+    // Lock the selectors too: a scene/config switch mid-solve would race the
+    // mesh/solve on the server. (We still set config-select.value to track the
+    // build's progress; a disabled select can be updated programmatically.)
+    if (modeSel) modeSel.disabled = true;
+    if (cfgSel) cfgSel.disabled = true;
+  } else {
+    if (solveBtn) solveBtn.disabled = false;
+    if (restartBtn) restartBtn.disabled = false;
+    if (modeSel) modeSel.disabled = false;
+    applyConfigUi();   // re-gates config-select + build button to the 12-dipole scene
+  }
+}
+
+function applyBuildFieldsStatus(data) {
+  if (data.state === "start") {
+    setBusyFlag("build", true);
+    _setBuildStatus(`Build: grid rebuild + ${data.total} solves…`);
+  } else if (data.state === "done") {
+    setBusyFlag("build", false);
+    _setBuildStatus(`✓ ${data.total} field files → /fields`, "#3fb950");
+  } else if (data.state === "error") {
+    setBusyFlag("build", false);
+    _setBuildStatus(`Build error: ${data.error ?? "?"}`, "#f85149");
+  }
+}
+
+function applyBuildFieldsProgress(data) {
+  if (data.phase === "viewer_mesh") {
+    setBusyFlag("mesh", true);
+    _setBuildStatus(`Build: rebuilding extended grid for viewer…`);
+    return;
+  }
+  if (data.phase === "mesh") {
+    _setBuildStatus(`Build: rebuilding extended grid (1) + ${data.total} solves…`);
+    return;
+  }
+  if (data.phase === "solving") {
+    // Reflect the config currently being solved in the dropdown + status.
+    const sel = document.getElementById("config-select");
+    if (sel) sel.value = data.config;
+    _setBuildStatus(`Build: solving ${data.index + 1}/${data.total} · ${data.config}…`);
+    return;
+  }
+  if (data.phase === "solved") {
+    _setBuildStatus(`Build: solved ${data.done}/${data.total} · ${data.config} (max|B|=${data.max_B_T} T)`);
+  }
+}
 
 const _blineSlider = document.getElementById("bline-opacity-slider");
 if (_blineSlider) {
@@ -1472,7 +1385,14 @@ if (_blineSlider) {
     const val = document.getElementById("bline-opacity-val");
     if (val) val.textContent = v.toFixed(2);
     applyBlineVisibility();
+    applyBsurfVisibility();
   });
+}
+
+const _bsurfSlider = document.getElementById("bsurf-slider");
+if (_bsurfSlider) {
+  _bsurfSlider.addEventListener("input", scheduleBsurf);
+  updateBsurfReadout();
 }
 
 const _blineMuSlider = document.getElementById("bline-mu-slider");
@@ -1485,26 +1405,10 @@ if (_blineMuSlider) {
   showMu();
 }
 
-// ─── Coil texture updates (spinning-cubes view) ───────────────────────────────
-let _lastTexUpdate = 0;
-function maybeRedrawTextures(now) {
-  if (_currentView !== "spinning_cubes") return;
-  if (now - _lastTexUpdate < 50) return;
-  _lastTexUpdate = now;
-  for (const { coilData, textures } of cubeModules) {
-    for (let fi = 0; fi < 6; fi++) {
-      drawFace(textures[fi].userData.canvas, coilData[fi]);
-      textures[fi].needsUpdate = true;
-    }
-  }
-}
-
 // ─── Render loop ──────────────────────────────────────────────────────────────
-function tick(now) {
+function tick() {
   requestAnimationFrame(tick);
-  maybeRedrawTextures(now);
   controls.update();
-  updateCmVisibility();
   renderer.render(scene, camera);
 }
-tick(performance.now());
+tick();

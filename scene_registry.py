@@ -1,15 +1,15 @@
-"""scene_registry.py — Experiment scenes inside the shared cube envelope."""
+"""scene_registry.py — NGSolve experiment scenes inside the shared cube envelope."""
 
 from __future__ import annotations
 
-SCENE_IDS = ("1dipole", "12dipoles_ng", "30coils_ng", "frame", "dipole", "12dipoles")
+import ng_config
+
+SCENE_IDS = ("1dipole", "12dipoles_ng", "30coils_ng", "potcore_ng")
 SCENE_LABELS = {
     "1dipole":      "1 dipole",
     "12dipoles_ng": "12 dipoles",
     "30coils_ng":   "30 coils",
-    "frame":        "30 coils (voxel)",
-    "dipole":       "Dipole (voxel)",
-    "12dipoles":    "12 dipoles (voxel)",
+    "potcore_ng":   "1 pot core",
 }
 
 
@@ -18,48 +18,33 @@ def list_scenes() -> list[tuple[str, str]]:
 
 
 def get_scene_id() -> str:
-    import fea_config
-    sid = (fea_config.FEA_SCENE_ID or "frame").strip().lower()
-    return sid if sid in SCENE_IDS else "frame"
+    sid = (ng_config.NG_SCENE_ID or "1dipole").strip().lower()
+    return sid if sid in SCENE_IDS else "1dipole"
 
 
 def invalidate_all_caches():
-    from fea_model import invalidate_cache as inv_frame
-    from scene_dipole import invalidate_cache as inv_dipole
-    from scene_12dipoles import invalidate_cache as inv_12dipoles
     from scene_ngmesh import invalidate_cache as inv_ngmesh
     from scene_ng12dipoles import invalidate_cache as inv_ng12dipoles
     from ng_frame import invalidate_cache as inv_ng30
+    from scene_potcore import invalidate_cache as inv_potcore
 
-    inv_frame()
-    inv_dipole()
-    inv_12dipoles()
     inv_ngmesh()
     inv_ng12dipoles()
     inv_ng30()
+    inv_potcore()
 
 
-def build_scene(force: bool = False, fea_strength_scale: float = 1.0) -> dict:
-    """Build the active experiment scene (voxel_scene dict)."""
+def build_scene(force: bool = False, strength_scale: float = 1.0) -> dict:
+    """Build the active NGSolve scene (fea_mesh payload)."""
     sid = get_scene_id()
     if sid == "1dipole":
         from scene_ngmesh import build_ngmesh_scene
-        return build_ngmesh_scene(force=force, fea_strength_scale=fea_strength_scale)
+        return build_ngmesh_scene(force=force, fea_strength_scale=strength_scale)
     if sid == "12dipoles_ng":
         from scene_ng12dipoles import build_scene as build_ng12
-        return build_ng12(force=force, fea_strength_scale=fea_strength_scale)
-    if sid == "30coils_ng":
-        from ng_frame import build_scene as build_ng30
-        return build_ng30(force=force, fea_strength_scale=fea_strength_scale)
-    if sid == "dipole":
-        from scene_dipole import build_dipole_scene
-        return build_dipole_scene(force=force, fea_strength_scale=fea_strength_scale)
-    if sid == "12dipoles":
-        from scene_12dipoles import build_12dipoles_scene
-        return build_12dipoles_scene(force=force, fea_strength_scale=fea_strength_scale)
-    from fea_model import build_frame_scene
-    return build_frame_scene(force=force, fea_strength_scale=fea_strength_scale)
-
-
-# Back-compat alias used by server / tests
-build_voxel_scene = build_scene
+        return build_ng12(force=force, fea_strength_scale=strength_scale)
+    if sid == "potcore_ng":
+        from scene_potcore import build_scene as build_potcore
+        return build_potcore(force=force, fea_strength_scale=strength_scale)
+    from ng_frame import build_scene as build_ng30
+    return build_ng30(force=force, fea_strength_scale=strength_scale)

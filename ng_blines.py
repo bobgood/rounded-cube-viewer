@@ -1,15 +1,12 @@
-"""fea_blines.py — Trace magnetic field lines (streamlines of B) on the voxel grid.
+"""ng_blines.py — Trace magnetic field lines (streamlines of B).
 
 Given B = (Bx, By, Bz) sampled on a regular lattice (origin_mm, spacing h), we:
-  1. Seed on a uniform spatial sub-lattice wherever |B| clears a floor (symmetric
-     coverage — no bias toward whichever pole happens to be hottest).
+  1. Seed on a uniform spatial sub-lattice wherever |B| clears a floor.
   2. Integrate dx/ds = B/|B| (RK2) forward and backward from each seed.
-  3. Continue into much weaker field (stop_floor) so lines arc pole-to-pole, and
-     stop at the domain edge, where |B| < stop_floor, or after max steps.
+  3. Stop at the domain edge, where |B| < stop_floor, or after max steps.
 
-Each emitted point is (x, y, z, b_norm) where b_norm = |B| / max|B| in [0, 1] for
-strength-based colouring. Output is in millimetres; the caller scales to scene units.
-This is a "rough" visualization aid, not a precise flux computation.
+Each emitted point is (x, y, z, b_norm) where b_norm = |B| / max|B| in [0, 1].
+Output is in millimetres; the caller scales to scene units.
 """
 
 from __future__ import annotations
@@ -44,10 +41,7 @@ def _sample_B(p, Bx, By, Bz, origin, h, nx, ny, nz):
 
 
 def _trace_one(seed, sign, Bx, By, Bz, origin, h, nx, ny, nz, step, max_steps, stop_floor):
-    """Integrate a half-line from seed along +B (sign=+1) or -B (sign=-1).
-
-    Returns a list of (x, y, z, |B|) points (excluding the seed itself).
-    """
+    """Integrate a half-line from seed along +B (sign=+1) or -B (sign=-1)."""
     pts = []
     p = np.array(seed, dtype=np.float64)
     for _ in range(max_steps):
@@ -81,11 +75,7 @@ def trace_field_lines(
     min_B_frac: float = 0.04,
     stop_frac: float = 0.004,
 ) -> dict:
-    """Trace streamlines from a solve_b_arrays() result. Returns lines (mm) + meta.
-
-    Seeds: uniform spatial sub-lattice (every ``seed_stride`` cells) where
-    |B| > ``min_B_frac`` * max|B|.  Lines continue until |B| < ``stop_frac`` * max|B|.
-    """
+    """Trace streamlines from a B-field lattice. Returns lines (mm) + meta."""
     Bx, By, Bz = sol["Bx"], sol["By"], sol["Bz"]
     B_mag = sol["B_mag"]
     origin = np.asarray(sol["origin_mm"], dtype=np.float64)
@@ -99,7 +89,6 @@ def trace_field_lines(
     seed_floor = min_B_frac * max_B
     stop_floor = max(stop_frac * max_B, 1e-12)
 
-    # Uniform spatial sub-lattice (symmetric coverage), gated by the seed floor.
     s = max(1, int(seed_stride))
     ii, jj, kk = np.meshgrid(
         np.arange(1, nx - 1, s),
@@ -112,7 +101,6 @@ def trace_field_lines(
     ci, cj, ck = ci[keep], cj[keep], ck[keep]
     n_seeds = int(ci.size)
 
-    # Even spatial spread to max_lines (deterministic; no random clustering).
     if n_seeds > max_lines:
         pick = np.linspace(0, n_seeds - 1, max_lines).astype(int)
         ci, cj, ck = ci[pick], cj[pick], ck[pick]

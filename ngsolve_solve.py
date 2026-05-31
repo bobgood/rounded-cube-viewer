@@ -24,8 +24,7 @@ iterative convergence risk). A tiny mass term regularizes the curl-curl
 gradient null space.
 
 B is then sampled onto a regular lattice (reported in mm) and streamlined with
-the existing fea_blines tracer, shipping as the same "bfield_lines" payload the
-viewer already renders.
+ng_blines, shipping as the "bfield_lines" payload the viewer renders.
 """
 
 from __future__ import annotations
@@ -44,16 +43,14 @@ from ng_config import (
     NG_SOLVE_NEWTON_MAXIT,
     NG_SOLVE_NEWTON_TOL,
     NG_FIELD_SAMPLE_MM,
+    NG_BLINE_MAX_LINES,
+    NG_BLINE_STEP_MM,
+    NG_BLINE_MAX_STEPS,
+    NG_BLINE_SEED_STRIDE,
+    NG_BLINE_MIN_B_FRAC,
+    NG_BLINE_STOP_FRAC,
 )
-from fea_config import (
-    FEA_BLINE_MAX_LINES,
-    FEA_BLINE_STEP_MM,
-    FEA_BLINE_MAX_STEPS,
-    FEA_BLINE_SEED_STRIDE,
-    FEA_BLINE_MIN_B_FRAC,
-    FEA_BLINE_STOP_FRAC,
-)
-from fea_blines import trace_field_lines
+from ng_blines import trace_field_lines
 
 _MU0 = 4.0e-7 * pi
 
@@ -218,12 +215,12 @@ def _run_scene_solve(build_geometry, *, tag: str, mu_r: float,
 
     traced = trace_field_lines(
         sol,
-        max_lines=FEA_BLINE_MAX_LINES,
-        step_mm=FEA_BLINE_STEP_MM,
-        max_steps=FEA_BLINE_MAX_STEPS,
-        seed_stride=FEA_BLINE_SEED_STRIDE,
-        min_B_frac=FEA_BLINE_MIN_B_FRAC,
-        stop_frac=FEA_BLINE_STOP_FRAC,
+        max_lines=NG_BLINE_MAX_LINES,
+        step_mm=NG_BLINE_STEP_MM,
+        max_steps=NG_BLINE_MAX_STEPS,
+        seed_stride=NG_BLINE_SEED_STRIDE,
+        min_B_frac=NG_BLINE_MIN_B_FRAC,
+        stop_frac=NG_BLINE_STOP_FRAC,
     )
 
     sc = MM_TO_SCENE
@@ -232,6 +229,22 @@ def _run_scene_solve(build_geometry, *, tag: str, mu_r: float,
          for (px, py, pz, b) in poly]
         for poly in traced["lines"]
     ]
+
+    # Sampled |B| grid (scene units) so the client can extract force-metric
+    # isosurfaces live. Grid is (n,n,n) C-order: index = (i*n + j)*n + k, with
+    # point (i,j,k) at origin + (i,j,k)*step. Values are |B| in Tesla; the force
+    # metric (magnetic pressure B²/2μ0) is monotonic in |B|, so the client
+    # thresholds |B| directly and labels the level as force.
+    b_mag = sol["B_mag"]
+    n = sol["size"][0]
+    field = {
+        "n": int(n),
+        "origin": round(float(sol["origin_mm"][0]) * sc, 4),
+        "step": round(float(sol["spacing_mm"]) * sc, 5),
+        "b": [round(float(v), 5) for v in b_mag.ravel()],
+        "b_max": round(float(b_mag.max()), 4),
+    }
+
     meta = dict(traced["meta"])
     meta.update(solve_meta)
     meta["size"] = sol["size"]
@@ -247,7 +260,7 @@ def _run_scene_solve(build_geometry, *, tag: str, mu_r: float,
         f"({mode_note})  lines={meta['n_lines']}/{meta['n_seeds']} "
         f"seeds  max|B|={meta.get('max_B_T', 0.0):.3e} T"
     )
-    return {"type": "bfield_lines", "lines": lines_scene, "meta": meta}
+    return {"type": "bfield_lines", "lines": lines_scene, "field": field, "meta": meta}
 
 
 def solve_ng_bfield(*, mu_r: float = 1.0, fea_strength_scale: float = 1.0,
@@ -272,3 +285,105 @@ def solve_ng30_bfield(*, mu_r: float = 1.0, fea_strength_scale: float = 1.0,
     from ng_frame import build_geometry
     return _run_scene_solve(build_geometry, tag="30coils", mu_r=mu_r,
                             fea_strength_scale=fea_strength_scale, saturate=saturate)
+
+
+def solve_potcore_bfield(*, mu_r: float = 1.0, fea_strength_scale: float = 1.0,
+                         saturate: bool = False) -> dict:
+    """Solve the single pot-core ("potcore") scene → "bfield_lines" payload."""
+    from scene_potcore import build_geometry
+    return _run_scene_solve(build_geometry, tag="potcore", mu_r=mu_r,
+                            fea_strength_scale=fea_strength_scale, saturate=saturate)
+
+
+# ── Field-file export (per-config solver basis) ───────────────────────────────
+
+def export_ng12_field_files(*, strength: float = 1.0, mu_r: float = 1.0,
+                            saturate: bool = False, out_dir: str = "fields",
+                            configs=None):
+    """Solve every 12-dipole config and write a reusable vector-B field file each.
+
+    A generator: yields a phase dict per step so the caller can stream progress
+    between (slow) operations:
+      - {"phase": "mesh", "total": N}                       one-time grid rebuild
+      - {"phase": "solving", "index": i, "total": N, "config": name}  about to solve
+      - {"phase": "solved",  "done": i+1, "total": N, ...info}        wrote the file
+    The geometry (all 12 rods+coils) is identical across configs — only J changes
+    — so we mesh ONCE and re-solve each config on the same mesh. Each file is a
+    compressed ``.npz`` holding the sampled vector field Bx/By/Bz (Tesla) on a
+    regular mm lattice plus a ``meta_json`` recording exactly which dipoles were
+    energised and at what weight (for later superposition).
+
+    Linear (saturate=False) by default so the fields form a true linear basis.
+    """
+    import os
+    import json
+    from ngsolve import Mesh
+    import ng_config
+    import scene_ng12dipoles
+
+    names = list(configs) if configs else list(ng_config.NG12_CONFIGS.keys())
+    os.makedirs(out_dir, exist_ok=True)
+    total = len(names)
+
+    # Signal the (single) grid-rebuild phase, then mesh once. All 12 coil regions
+    # exist regardless of weights, so every config solves on this same mesh.
+    yield {"phase": "mesh", "total": total}
+    scene_ng12dipoles.invalidate_cache()
+    ngmesh, dipoles, meta_g = scene_ng12dipoles.build_geometry(length_scale=1.0e-3)
+    mesh = Mesh(ngmesh)
+    length_scale = meta_g["length_scale"]
+    half_extent_mm = meta_g["half_extent"] / length_scale
+
+    for i, name in enumerate(names):
+        # Announce the config first so the UI can show what is being solved while
+        # the (slow) solve below runs on the next generator step.
+        yield {"phase": "solving", "index": i, "total": total, "config": name}
+
+        cfg = ng_config.NG12_CONFIGS.get(name, {})
+        currents = {e: 0.0 for e in ng_config.NG12_EDGES}
+        currents.update(cfg)
+        for dp in dipoles:                       # retarget J on the SAME mesh
+            dp["weight"] = float(currents.get(dp["name"], 0.0))
+
+        B_cf, solve_meta = _solve_A_multi(mesh, dipoles, mu_r, strength, saturate=saturate)
+        sol = _sample_B(mesh, B_cf, half_extent_mm, NG_FIELD_SAMPLE_MM, length_scale)
+
+        n_active = int(sum(1 for v in currents.values() if abs(float(v)) > 1e-12))
+        meta = {
+            "scene": "12dipoles_ng",
+            "config": name,
+            "currents": {k: float(v) for k, v in currents.items()},
+            "strength": float(strength),
+            "mu_r": float(mu_r),
+            "saturate": bool(saturate),
+            "extended_grid": bool(ng_config.NG_EXTENDED_GRID),
+            "air_box_mm": round(2.0 * half_extent_mm, 2),
+            "sample_mm": float(NG_FIELD_SAMPLE_MM),
+            "size": [int(x) for x in sol["size"]],
+            "origin_mm": [float(v) for v in sol["origin_mm"]],
+            "spacing_mm": float(sol["spacing_mm"]),
+            "n_active": n_active,
+            "max_B_T": float(sol["B_mag"].max()),
+            "solver": "ngsolve-hcurl-nl" if saturate else "ngsolve-hcurl-lin",
+            "axis_order": "C-order (i,j,k); point = origin_mm + (i,j,k)*spacing_mm",
+            "units": {"B": "tesla", "length": "mm"},
+        }
+        path = os.path.join(out_dir, f"12dipoles_{name}.npz")
+        np.savez_compressed(
+            path,
+            Bx=sol["Bx"].astype(np.float32),
+            By=sol["By"].astype(np.float32),
+            Bz=sol["Bz"].astype(np.float32),
+            origin_mm=np.asarray(sol["origin_mm"], dtype=np.float64),
+            spacing_mm=np.float64(sol["spacing_mm"]),
+            size=np.asarray(sol["size"], dtype=np.int32),
+            meta_json=json.dumps(meta),
+        )
+        print(f"[fields] {i + 1}/{total}  {name}: {meta['size']} grid  "
+              f"max|B|={meta['max_B_T']:.3e} T  -> {path}")
+        yield {
+            "phase": "solved", "done": i + 1, "total": total,
+            "config": name, "file": os.path.abspath(path),
+            "n_active": n_active, "max_B_T": round(meta["max_B_T"], 4),
+            "size": meta["size"],
+        }

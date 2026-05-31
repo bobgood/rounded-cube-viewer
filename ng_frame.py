@@ -26,10 +26,9 @@ import time
 from functools import reduce
 
 from cube_config import FRAME_EDGE_MM
+import ng_config
 from ng_config import (
     NG_CUBE_HALF_MM,
-    NG_AIR_PADDING_MM,
-    NG_MESH_MAXH_MM,
     NG_MESH_MAXH_DEVICE_MM,
     NG30_ROD_RADIUS_MM,
     NG30_ROD_LENGTH_MM,
@@ -53,7 +52,7 @@ from ng_config import (
 )
 import ng_dipoles
 from ng_dipoles import (
-    cube_corner_positions, _unit, dipole_arrows,
+    cube_corner_positions, _unit, dipole_arrows, coil_drive_summary,
     STEEL_COLOR, COIL_COLOR, AIR_COLOR,
     STEEL_OPACITY, COIL_OPACITY, AIR_OPACITY,
 )
@@ -66,7 +65,7 @@ def invalidate_cache():
     _scene_cache = None
 
 
-# ── Topology (matches geometry_ids / cube_corner_positions numbering) ─────────
+# ── Topology (cube corner numbering c1..c8) ───────────────────────────────────
 # Undirected cube edges as (a, b); see cube_corner_positions for corner coords.
 _EDGES = [
     (1, 2), (2, 3), (3, 4), (4, 1),     # top ring  (+Z)
@@ -82,7 +81,7 @@ _FACES = [
 
 
 def _air_half_extent_mm() -> float:
-    return FRAME_EDGE_MM / 2.0 + NG_AIR_PADDING_MM
+    return FRAME_EDGE_MM / 2.0 + ng_config.air_padding_mm()
 
 
 def _edge_weight(near: int, far: int, currents: dict) -> float:
@@ -97,6 +96,44 @@ def _edge_weight(near: int, far: int, currents: dict) -> float:
 
 
 # ── Geometry specs (mm) ───────────────────────────────────────────────────────
+
+def face_horseshoe(facekey: str, normal: tuple, weight: float, *, face_half=None):
+    """Steel prims + coil for ONE nested-pipe ("pot core") face assembly.
+
+    Inner pipe + outer pipe (coaxial along the face normal, running inward from
+    the outer face) joined by a back washer; the coil sits in the annular gap.
+    Returns (metal_prims, coil_param). Shared by the 30-coils frame and the
+    single-horseshoe scene so the geometry stays in one place.
+    """
+    n = _unit(normal)
+    fh = FRAME_EDGE_MM / 2.0 if face_half is None else float(face_half)
+    inward = (-n[0], -n[1], -n[2])
+
+    r_io = NG30_HS_INNER_PIPE_OD_MM / 2.0
+    r_ii = r_io - NG30_HS_WALL_THICKNESS_MM
+    r_oo = NG30_HS_OUTER_PIPE_OD_MM / 2.0
+    r_oi = r_oo - NG30_HS_WALL_THICKNESS_MM
+    pipe_half = NG30_HS_LENGTH_MM / 2.0
+    wash_half = NG30_HS_WASHER_THICKNESS_MM / 2.0
+    cu_in = r_io + NG30_CU_CLEARANCE_FROM_HS_INNER_MM
+    cu_out = min(cu_in + NG30_CU_WALL_THICKNESS_MM, r_oi - NG30_CU_CLEARANCE_FROM_HS_OUTER_MM)
+    cu_half = (NG30_HS_LENGTH_MM + NG30_CU_EXTENSION_MM) / 2.0
+
+    pc = tuple(n[i] * fh + inward[i] * pipe_half for i in range(3))
+    wc = tuple(n[i] * fh + inward[i] * (NG30_HS_LENGTH_MM + wash_half) for i in range(3))
+    cc = tuple(n[i] * fh + inward[i] * cu_half for i in range(3))
+    metal = [
+        {"kind": "tube", "center": pc, "axis": n, "half": pipe_half, "r_in": r_ii, "r_out": r_io},
+        {"kind": "tube", "center": pc, "axis": n, "half": pipe_half, "r_in": r_oi, "r_out": r_oo},
+        {"kind": "tube", "center": wc, "axis": n, "half": wash_half, "r_in": r_ii, "r_out": r_oo},
+    ]
+    coil = {
+        "name": facekey, "center": cc, "axis": n,
+        "coil_half": cu_half, "coil_inner": cu_in, "coil_outer": cu_out,
+        "weight": float(weight), "has_coil": True,
+    }
+    return metal, coil
+
 
 def build_specs():
     """Return (metal_prims, coils) describing the whole frame in mm.
@@ -158,36 +195,10 @@ def build_specs():
             })
 
     # 6 face horseshoes (nested pipes + back washer) and their face coils.
-    face_half = FRAME_EDGE_MM / 2.0
-    r_io = NG30_HS_INNER_PIPE_OD_MM / 2.0
-    r_ii = r_io - NG30_HS_WALL_THICKNESS_MM
-    r_oo = NG30_HS_OUTER_PIPE_OD_MM / 2.0
-    r_oi = r_oo - NG30_HS_WALL_THICKNESS_MM
-    pipe_half = NG30_HS_LENGTH_MM / 2.0
-    wash_half = NG30_HS_WASHER_THICKNESS_MM / 2.0
-    cu_in = r_io + NG30_CU_CLEARANCE_FROM_HS_INNER_MM
-    cu_out = min(cu_in + NG30_CU_WALL_THICKNESS_MM, r_oi - NG30_CU_CLEARANCE_FROM_HS_OUTER_MM)
-    cu_half = (NG30_HS_LENGTH_MM + NG30_CU_EXTENSION_MM) / 2.0
-
     for facekey, n in _FACES:
-        inward = (-n[0], -n[1], -n[2])
-        # Pipe centre: face_half inward by pipe_half; washer sits behind the pipes.
-        pc = tuple(n[i] * face_half + inward[i] * pipe_half for i in range(3))
-        wc = tuple(n[i] * face_half + inward[i] * (NG30_HS_LENGTH_MM + wash_half)
-                   for i in range(3))
-        cc = tuple(n[i] * face_half + inward[i] * cu_half for i in range(3))
-        metal.append({"kind": "tube", "center": pc, "axis": n,
-                      "half": pipe_half, "r_in": r_ii, "r_out": r_io})    # inner pipe
-        metal.append({"kind": "tube", "center": pc, "axis": n,
-                      "half": pipe_half, "r_in": r_oi, "r_out": r_oo})    # outer pipe
-        metal.append({"kind": "tube", "center": wc, "axis": n,
-                      "half": wash_half, "r_in": r_ii, "r_out": r_oo})    # back washer
-        coils.append({
-            "name": facekey, "center": cc, "axis": n,
-            "coil_half": cu_half, "coil_inner": cu_in, "coil_outer": cu_out,
-            "weight": float(NG30_COIL_CURRENTS.get(facekey, 0.0)),
-            "has_coil": True,
-        })
+        hs_metal, coil = face_horseshoe(facekey, n, NG30_COIL_CURRENTS.get(facekey, 0.0))
+        metal.extend(hs_metal)
+        coils.append(coil)
 
     return metal, coils
 
@@ -269,7 +280,10 @@ def build_frame_mesh(metal, coils, *, air_half_extent_mm, maxh_mm,
 
     geo = OCCGeometry(Glue([steel] + coil_solids + [air]))
     ngmesh = geo.GenerateMesh(maxh=float(maxh_mm) * s)
-    meta = {"half_extent": h, "length_scale": s}
+    s3 = s ** 3
+    meta = {"half_extent": h, "length_scale": s,
+            "steel_vol_mm3": steel.mass / s3,                     # fused → overlap-correct
+            "copper_vol_mm3": sum(cs.mass for cs in coil_solids) / s3}
     return ngmesh, coil_params, meta
 
 
@@ -353,16 +367,22 @@ def build_geometry(length_scale: float = 1.0):
     )
 
 
-def _assemble_payload():
+def assemble_payload(metal, coils, scene_id, coil_weights):
+    """Mesh `metal`+`coils` and pack the "fea_mesh" payload the viewer renders.
+
+    Shared by the 30-coils frame and the single-horseshoe scene. Builds the Ou
+    frame config + coil arrows first (no mesh needed → they survive a mesh fail),
+    then meshes, classifies steel/coil/air triangles, and fills region data.
+    Returns (scene, build_s).
+    """
     from cube_config import MM_TO_SCENE, FRAME_INSET_MM
-    from scene_render import frame_config_dict
+    from ng_render import frame_config_dict
 
     sc = MM_TO_SCENE
-    metal, coils = build_specs()
     corners = cube_corner_positions(NG_CUBE_HALF_MM)
     frame_config = frame_config_dict(
         edge_mm=FRAME_EDGE_MM, height_mm=FRAME_EDGE_MM, inset_mm=FRAME_INSET_MM,
-        corner_pos_mm=corners, coil_weights=NG30_COIL_CURRENTS, sc=sc,
+        corner_pos_mm=corners, coil_weights=coil_weights, sc=sc,
     )
 
     # Tag coils with a material so dipole_arrows / classifier see a stable list,
@@ -371,9 +391,11 @@ def _assemble_payload():
         co["coil_mat"] = f"coil{i}"
     arrow_vs = round(NG30_ROD_RADIUS_MM * 0.15 * sc, 4)
     cu = dipole_arrows(coils, sc)
+    drive = coil_drive_summary(coils)
+    from ng_dipoles import mass_summary
 
     scene = {
-        "type": "fea_mesh", "scene_id": "30coils_ng",
+        "type": "fea_mesh", "scene_id": scene_id,
         "frame_config": frame_config, "voxel_size": arrow_vs,
         "vertices": [], "cu": cu, "regions": [], "meta": {},
     }
@@ -381,9 +403,9 @@ def _assemble_payload():
     build_s = 0.0
     try:
         t0 = time.perf_counter()
-        ngmesh, coil_params, _meta_g = build_frame_mesh(
+        ngmesh, coil_params, meta_g = build_frame_mesh(
             metal, coils, air_half_extent_mm=_air_half_extent_mm(),
-            maxh_mm=NG_MESH_MAXH_MM, maxh_device_mm=NG_MESH_MAXH_DEVICE_MM,
+            maxh_mm=ng_config.mesh_maxh_mm(), maxh_device_mm=NG_MESH_MAXH_DEVICE_MM,
             length_scale=1.0,
         )
         verts, tris = extract_surface(ngmesh, metal, coil_params, sc)
@@ -403,11 +425,15 @@ def _assemble_payload():
             "n_tris": len(st) + len(co_t) + len(ai),
             "n_steel_tris": len(st), "n_coil_tris": len(co_t), "n_air_tris": len(ai),
             "air_box_mm": round(2.0 * _air_half_extent_mm(), 2),
-            "maxh_mm": NG_MESH_MAXH_MM, "maxh_device_mm": NG_MESH_MAXH_DEVICE_MM,
+            "maxh_mm": ng_config.mesh_maxh_mm(), "maxh_device_mm": NG_MESH_MAXH_DEVICE_MM,
             "mesh_s": round(build_s, 2),
+            "extended_grid": ng_config.NG_EXTENDED_GRID,
+            **drive,
+            **mass_summary(meta_g.get("steel_vol_mm3", 0.0),
+                           meta_g.get("copper_vol_mm3", 0.0)),
         }
     except Exception as exc:  # noqa: BLE001 — keep frame + arrows; report failure
-        scene["meta"] = {"error": f"{type(exc).__name__}: {exc}"}
+        scene["meta"] = {"error": f"{type(exc).__name__}: {exc}", **drive}
 
     return scene, build_s
 
@@ -417,7 +443,8 @@ def build_scene(force: bool = False, fea_strength_scale: float = 1.0):
     if _scene_cache is not None and not force:
         return _scene_cache
 
-    scene, _build_s = _assemble_payload()
+    metal, coils = build_specs()
+    scene, _build_s = assemble_payload(metal, coils, "30coils_ng", NG30_COIL_CURRENTS)
     n_active = sum(1 for v in NG30_COIL_CURRENTS.values() if abs(float(v)) > 1e-9)
     m = scene["meta"]
     if m.get("error"):
@@ -426,11 +453,12 @@ def build_scene(force: bool = False, fea_strength_scale: float = 1.0):
         m.update({
             "n_coils": 30, "n_active_corner_face_keys": n_active,
             "rod_radius_mm": NG30_ROD_RADIUS_MM, "rod_length_mm": NG30_ROD_LENGTH_MM,
-            "air_padding_mm": NG_AIR_PADDING_MM,
+            "air_padding_mm": ng_config.air_padding_mm(),
         })
         print(
             f"[ng] scene=30coils_ng  coils=30 (24 edge + 6 face)  "
-            f"air_pad={NG_AIR_PADDING_MM}mm (box {m['air_box_mm']:.0f}mm)  maxh={NG_MESH_MAXH_MM}mm  "
+            f"air_pad={ng_config.air_padding_mm()}mm (box {m['air_box_mm']:.0f}mm)"
+            f"{' [EXT]' if ng_config.NG_EXTENDED_GRID else ''}  maxh={ng_config.mesh_maxh_mm()}mm  "
             f"points={m['n_points']:,}  steel={m['n_steel_tris']:,}  coil={m['n_coil_tris']:,}  "
             f"air={m['n_air_tris']:,}  {m['mesh_s']}s"
         )

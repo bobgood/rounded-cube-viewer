@@ -19,7 +19,7 @@ from cube_config import FRAME_EDGE_MM, FRAME_INSET_MM
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ SHARED — cube frame (self-contained; no fea_* dependency)                  ║
+# ║ SHARED — cube frame                                                     ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 # The inset cube "skeleton" rods/dipoles are placed on. Corners sit at
 # +/- NG_CUBE_HALF_MM on each axis. For the 32 mm cube with 5 mm inset this is
@@ -27,17 +27,56 @@ from cube_config import FRAME_EDGE_MM, FRAME_INSET_MM
 NG_CUBE_HALF_MM = FRAME_EDGE_MM / 2.0 - FRAME_INSET_MM   # half-edge of the skeleton
 NG_CUBE_EDGE_MM = 2.0 * NG_CUBE_HALF_MM                  # full skeleton edge length
 
+# Active experiment (dropdown / server message)
+NG_SCENE_ID = "1dipole"   # "1dipole" | "12dipoles_ng" | "30coils_ng" | "potcore_ng"
+
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ SHARED — mesh density (applies to every NGSolve scene)                     ║
+# ║ SHARED — air, mesh, solver, B-line tracing (all NGSolve scenes)            ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
-# Smaller maxh = denser mesh = more triangles/tets = slower but more accurate.
-# Strategy: keep the far air COARSE (global) and refine only the device, where
-# the field (and later, saturation) concentrates. Meshing the whole air box at
-# device resolution is what makes builds slow, so don't.
-NG_MESH_MAXH_MM = 4.0           # global/far-air max element size (mm), incl. air box
-# Finer element size on device surfaces (rod + coil); None = use global.
-NG_MESH_MAXH_DEVICE_MM = 1.5
+NG_AIR_PADDING_MM = 22.0        # air box padding beyond cube envelope (mm)
+NG_MESH_MAXH_MM = 4.0           # global/far-air max element size (mm)
+NG_MESH_MAXH_DEVICE_MM = 1.5    # device surface refinement; None = use global
+
+# ── Extended grid (UI checkbox) ──────────────────────────────────────────────
+# A much larger air box for capturing the far field needed by the (later) two-
+# body force/motion model. The cube edge is FRAME_EDGE_MM (~32 mm); this padding
+# pushes the box out to ≈200 mm overall (~3 cube-edges of clearance from centre),
+# which comfortably contains the force-relevant near field even after the
+# Strength slider is turned well up (B ∝ I, so the meaningful radius grows only
+# ~∝ I^(1/3)). Paired with a coarser far-air element size so the mesh stays
+# tractable (fine device detail is preserved by NG_MESH_MAXH_DEVICE_MM).
+NG_AIR_PADDING_EXTENDED_MM = 84.0   # → box ≈ 200 mm (vs 76 mm normal)
+NG_MESH_MAXH_EXTENDED_MM = 8.0      # coarser far-air elements when extended
+NG_EXTENDED_GRID = False            # runtime toggle (server sets from the checkbox)
+
+
+def air_padding_mm() -> float:
+    """Active air-box padding (mm): extended when the grid checkbox is on."""
+    return NG_AIR_PADDING_EXTENDED_MM if NG_EXTENDED_GRID else NG_AIR_PADDING_MM
+
+
+def mesh_maxh_mm() -> float:
+    """Active far-air max element size (mm): coarser when the grid is extended."""
+    return NG_MESH_MAXH_EXTENDED_MM if NG_EXTENDED_GRID else NG_MESH_MAXH_MM
+NG_COIL_CURRENT_A_MM2 = 120.0   # |J| base density per unit coil weight (A/mm²)
+NG_COIL_RESISTIVITY_OHM_M = 1.72e-8   # copper @20°C; ohmic-loss estimate assumes
+                                      # the coil annulus is solid conductor (fill=1)
+NG_STEEL_DENSITY_G_CM3 = 7.87   # iron/steel density for the mass readout (g/cm³)
+NG_COPPER_DENSITY_G_CM3 = 8.96  # copper density for the mass readout (g/cm³)
+NG_IRON_B_KNEE_T = 1.8          # iron saturation knee (Tesla)
+NG_SOLVE_ORDER = 1
+NG_SOLVE_RAMP_STEPS = 2
+NG_SOLVE_NEWTON_MAXIT = 6
+NG_SOLVE_NEWTON_TOL = 1e-4
+NG_FIELD_SAMPLE_MM = 2.0
+NG_BLINE_MAX_LINES = 140
+NG_BLINE_STEP_MM = 1.0
+NG_BLINE_MAX_STEPS = 900
+NG_BLINE_SEED_STRIDE = 2
+NG_BLINE_MIN_B_FRAC = 0.04
+NG_BLINE_STOP_FRAC = 0.004
+NG_MU_R_MAX = 5000.0            # top of the UI log Steel μ slider
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -49,65 +88,16 @@ NG_ROD_RADIUS_MM = 3.5      # outer radius of the steel rod (mm)
 NG_ROD_LENGTH_MM = 22.0     # length of the rod along its axis (mm)
 
 # ── Coil (solenoid sleeve around the rod) ────────────────────────────────────
-# Hollow tube defined by inner and outer radius. Inner must clear the rod
-# (NG_COIL_INNER_RADIUS_MM > NG_ROD_RADIUS_MM); the gap is the winding clearance.
 NG_COIL_INNER_RADIUS_MM = 4.0   # inner radius of the coil tube (mm)
 NG_COIL_OUTER_RADIUS_MM = 5.2   # outer radius of the coil tube (mm)
 NG_COIL_LENGTH_MM = 22.0        # coil length along the axis (mm)
 
 # ── Placement relative to the cube envelope ──────────────────────────────────
-# Perpendicular distance from the cube's corner edge inward to the rod
-# centreline, applied along BOTH axes normal to the rod (y and z). With the
-# 32 mm cube, 5 mm puts the centreline at (·, 11, 11) — the original placement.
 NG_CENTERLINE_OFFSET_FROM_EDGE_MM = 5.0
 
-# ── Air region (the box the field loops through) ─────────────────────────────
-# The air box = cube envelope expanded by this distance beyond every face in
-# +/- x, y and z. Larger = more accurate open-boundary field (lines loop
-# naturally) but more elements. ~1 device size is a sensible start.
-# Active size: 22 mm padding → a 76 mm air cube around the 32 mm envelope.
-NG_AIR_PADDING_MM = 22.0
-
-# ── Coil current weights (one entry per coil, same convention as coil_init.py) ──
+# ── Coil current weights ─────────────────────────────────────────────────────
 # Key = edge label e{c1}{c2}: positive → B toward the FIRST-named corner.
-# Sign controls current direction (and therefore field polarity).
-# |value| is a relative weight; the solver multiplies by NG_COIL_CURRENT_A_MM2.
-# Set an edge to 0.0 to disable that coil entirely (no arrows, no J).
-# The Strength slider (fea_strength_scale) is a further global multiplier.
-# Example: {"e14": 1.0} drives the single coil on edge e14 in the +direction.
-# A future 12-coil scene would list all 12 edges: {"e12": 1.0, "e15": -1.0, ...}
 NG_COIL_CURRENTS: dict = {"e14": 1.0}
-
-# Base current density (A/mm²) for each unit-weight coil turn.
-# This is an effective ampere-turn density for a multi-turn winding — large
-# by design so the rod sits near the saturation knee at Strength=1.
-NG_COIL_CURRENT_A_MM2 = 120.0
-
-# ── Iron B–H saturation (nonlinear magnetostatics) ───────────────────────────
-# Reluctivity nu(|B|) for "typical iron", as a smooth sigmoid in |B|^2:
-#     nu(0)   = 1/(mu0 * mu_init)   → unsaturated, high permeability
-#     nu(inf) = 1/mu0              → saturated, behaves like air (mu_r → 1)
-# mu_init (the unsaturated relative permeability) comes from the "Steel μ"
-# slider at solve time; the knee below is the fixed material property.
-# B_KNEE is where permeability collapses; ~1.8–2.1 T is typical for iron/steel.
-NG_IRON_B_KNEE_T = 1.8      # saturation knee field (Tesla)
-# The solver meshes in metres (length_scale 1e-3) so curl(A) is in real Tesla
-# and this knee is physically meaningful — do not change that scaling lightly.
-
-# ── Solve (nonlinear magnetostatic, H(curl) edge elements) ───────────────────
-NG_SOLVE_ORDER = 1          # H(curl) polynomial order (1 = lowest-order Nédélec)
-# Newton iteration: the target current is reached by ramping (load-stepping) in
-# NG_SOLVE_RAMP_STEPS increments, each warm-started from the previous, so full
-# Newton steps stay in the convergence basin even deep into saturation.
-NG_SOLVE_RAMP_STEPS = 2
-NG_SOLVE_NEWTON_MAXIT = 6   # max Newton iters per ramp step
-# Residual tolerance. The direct curl-curl solve floors near ~1e-4 (round-off at
-# this conditioning); the FIELD is fully settled well before then, so this is set
-# at the floor to report "converged" cleanly rather than warn at every solve.
-NG_SOLVE_NEWTON_TOL = 1e-4
-# Field-line sampling grid (B is sampled onto this lattice, then streamlined via
-# the existing fea_blines tracer). Coarser = faster.
-NG_FIELD_SAMPLE_MM = 2.0
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -117,13 +107,11 @@ NG_FIELD_SAMPLE_MM = 2.0
 # rod is shorter than its edge and centred on the edge midpoint. All bodies use
 # the same cross-section; only placement/orientation and coil current differ.
 #
-# Cube-corner frame (self-contained — no fea_* dependency)
+# Cube-corner frame
 # --------------------------------------------------------
 # The 8 skeleton corners sit at +/- NG_CUBE_HALF_MM on each axis, where
 # NG_CUBE_HALF_MM = FRAME_EDGE_MM/2 - FRAME_INSET_MM (= 11 mm for the 32 mm cube
-# with 5 mm inset). Corner numbering matches geometry_ids (c1..c8); see
-# ng_dipoles.cube_corner_positions(). Edge e{a}{b} runs from corner a to b and
-# its coil's +current drives B toward the FIRST-named corner a.
+# with 5 mm inset). Corner numbering c1..c8; see ng_dipoles.cube_corner_positions().
 
 # ── Rod + coil cross-section (shared by all 12 dipoles) ──────────────────────
 NG12_ROD_RADIUS_MM      = 3.5   # steel rod outer radius (mm)
@@ -140,23 +128,47 @@ NG12_ROD_LENGTH_MM   = 11.0   # rod length along its edge (mm), centred
 NG12_COIL_LENGTH_MM  = 11.0   # coil length along its edge (mm), centred
 
 # ── Per-edge coil current weights (signed; same convention as NG_COIL_CURRENTS) ─
-# Key = edge label e{a}{b}; +weight → B toward the first-named corner a.
-# 0.0 disables that coil's arrows/current (the rod is still drawn). The Strength
-# slider scales all of these; NG_COIL_CURRENT_A_MM2 is the per-unit base density.
-# Default mirrors the old voxel 12-dipole demo: the four vertical struts driven.
-NG12_COIL_CURRENTS: dict = {
-    # Top ring (+Z):    e12  e23  e34  e41
-    "e12": 0.0, "e23": 0.0, "e34": 0.0, "e41": 0.0,
-    # Bottom ring (−Z): e56  e67  e78  e85
-    "e56": 0.0, "e67": 0.0, "e78": 0.0, "e85": 0.0,
-    # Vertical struts:  e15  e26  e37  e48
-    "e15": 1.0, "e26": 1.0, "e37": 1.0, "e48": 1.0,
+# Key = edge label e{a}{b}; +weight → B toward the first-named corner a. The
+# Strength slider scales all of these; NG_COIL_CURRENT_A_MM2 is the per-unit base
+# density. All 12 rods are always built; weights only set which coils are driven.
+#
+# Named CONFIGS (UI "config" dropdown). Each is a sparse {edge: weight} override
+# on a 0.0 baseline — only listed edges are driven. We later run every config to
+# generate a solver/field file per excitation pattern. Edit / add freely.
+NG12_EDGES = (
+    "e12", "e23", "e34", "e41",     # top ring (+Z)
+    "e56", "e67", "e78", "e85",     # bottom ring (−Z)
+    "e15", "e26", "e37", "e48",     # vertical struts
+)
+NG12_CONFIGS: dict = {
+    # face:   all 4 vertical struts, same polarity → top face (+Z) N, bottom (−Z) S.
+    "face":   {"e15": 1.0, "e26": 1.0, "e37": 1.0, "e48": 1.0},
+    # edge:   two adjacent vertical struts → a dipole localised to one vertical edge.
+    "edge":   {"e15": 1.0, "e26": 1.0},
+    # twist1: two adjacent struts driven in OPPOSITE directions (up/down) → a
+    #         localised shear/twist between corners 1 and 2.
+    "twist1": {"e15": 1.0, "e26": -1.0},
+    # twist2: all four struts, 2 up / 2 down (adjacent pairs) → a full-cube twist
+    #         (corners 1,2 up; 3,4 down).
+    "twist2": {"e15": 1.0, "e26": 1.0, "e37": -1.0, "e48": -1.0},
+    # corner: the three edges meeting at corner 1, all north toward corner 1.
+    "corner": {"e12": 1.0, "e41": -1.0, "e15": 1.0},
+    # dipole: a single coil → the weakest, most localised dipole.
+    "dipole": {"e15": 1.0},
 }
+NG12_CONFIG_ACTIVE = "face"   # runtime selection (server sets from the dropdown)
+
+
+def ng12_currents() -> dict:
+    """Full 12-edge weight dict for the active config (0.0 for undriven edges)."""
+    base = {e: 0.0 for e in NG12_EDGES}
+    base.update(NG12_CONFIGS.get(NG12_CONFIG_ACTIVE, NG12_CONFIGS["face"]))
+    return base
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ SCENE: "30coils" — full frame (split edge coils + corner caps + face        ║
-# ║         horseshoes). Ported from the old voxel "frame"/"30 coils" scene.    ║
+# ║         horseshoes).                                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 # Steel skeleton = 12 edge rods + 8 corner caps (sphere + 3 collar stubs) + a
 # nested-pipe "horseshoe" on each of the 6 faces (inner pipe + outer pipe joined
@@ -207,3 +219,14 @@ NG30_COIL_CURRENTS: dict = {
     "f1234": 0.0, "f5678": 0.0, "f1265": 0.0,
     "f3487": 0.0, "f1485": 0.0, "f3276": 0.0,
 }
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ SCENE: "potcore" — a single nested-pipe pot-core (cup-core) assembly.       ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+# One face assembly lifted out of the 30-coils frame: two coaxial steel pipes
+# (NG30_HS_*) joined by a back washer, with one coil (NG30_CU_*) in the annulus.
+# It reuses all NG30_HS_*/NG30_CU_* dimensions above; only the placement (which
+# face) and drive current are scene-specific.
+NGPC_FACE_KEY = "f1234"   # which cube face the pot core sits on (outward +Z)
+NGPC_NORMAL   = (0.0, 0.0, 1.0)   # outward face normal for NGPC_FACE_KEY
+NGPC_CURRENT  = 1.0       # coil current weight (×strength); sign sets polarity

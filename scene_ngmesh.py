@@ -12,6 +12,7 @@ polarity), and a steel/coil/air mesh overlay (mesh slider).
 from __future__ import annotations
 
 from cube_config import FRAME_EDGE_MM
+import ng_config
 from ng_config import (
     NG_CUBE_HALF_MM,
     NG_ROD_RADIUS_MM,
@@ -20,8 +21,6 @@ from ng_config import (
     NG_COIL_OUTER_RADIUS_MM,
     NG_COIL_LENGTH_MM,
     NG_CENTERLINE_OFFSET_FROM_EDGE_MM,
-    NG_AIR_PADDING_MM,
-    NG_MESH_MAXH_MM,
     NG_MESH_MAXH_DEVICE_MM,
     NG_COIL_CURRENTS,
 )
@@ -42,7 +41,7 @@ def _centerline_mm() -> float:
 
 
 def _air_half_extent_mm() -> float:
-    return FRAME_EDGE_MM / 2.0 + NG_AIR_PADDING_MM
+    return FRAME_EDGE_MM / 2.0 + ng_config.air_padding_mm()
 
 
 def build_specs() -> list:
@@ -70,7 +69,7 @@ def build_geometry(length_scale: float = 1.0):
     return ng_dipoles.build_dipole_mesh(
         build_specs(),
         air_half_extent_mm=_air_half_extent_mm(),
-        maxh_mm=NG_MESH_MAXH_MM,
+        maxh_mm=ng_config.mesh_maxh_mm(),
         maxh_device_mm=NG_MESH_MAXH_DEVICE_MM,
         length_scale=length_scale,
     )
@@ -84,7 +83,7 @@ def build_ngmesh_scene(force: bool = False, fea_strength_scale: float = 1.0):
     scene, _build_s = ng_dipoles.assemble_scene_payload(
         "1dipole", build_specs(), NG_COIL_CURRENTS,
         air_half_extent_mm=_air_half_extent_mm(),
-        maxh_mm=NG_MESH_MAXH_MM, maxh_device_mm=NG_MESH_MAXH_DEVICE_MM,
+        maxh_mm=ng_config.mesh_maxh_mm(), maxh_device_mm=NG_MESH_MAXH_DEVICE_MM,
         arrow_radius_mm=NG_ROD_RADIUS_MM, half=NG_CUBE_HALF_MM,
     )
 
@@ -97,12 +96,14 @@ def build_ngmesh_scene(force: bool = False, fea_strength_scale: float = 1.0):
             "coil_inner_mm": NG_COIL_INNER_RADIUS_MM, "coil_outer_mm": NG_COIL_OUTER_RADIUS_MM,
             "coil_length_mm": NG_COIL_LENGTH_MM,
             "centerline_offset_mm": NG_CENTERLINE_OFFSET_FROM_EDGE_MM,
-            "air_padding_mm": NG_AIR_PADDING_MM,
+            "air_padding_mm": ng_config.air_padding_mm(),
+            "extended_grid": ng_config.NG_EXTENDED_GRID,
         })
         print(
             f"[ng] scene=1dipole  rod r={NG_ROD_RADIUS_MM}mm L={NG_ROD_LENGTH_MM}mm  "
             f"coil {NG_COIL_INNER_RADIUS_MM}-{NG_COIL_OUTER_RADIUS_MM}mm L={NG_COIL_LENGTH_MM}mm  "
-            f"air_pad={NG_AIR_PADDING_MM}mm (box {m['air_box_mm']:.0f}mm)  maxh={NG_MESH_MAXH_MM}mm  "
+            f"air_pad={ng_config.air_padding_mm()}mm (box {m['air_box_mm']:.0f}mm){' [EXT]' if ng_config.NG_EXTENDED_GRID else ''}  "
+            f"maxh={ng_config.mesh_maxh_mm()}mm  "
             f"points={m['n_points']:,}  steel={m['n_steel_tris']:,}  coil={m['n_coil_tris']:,}  "
             f"air={m['n_air_tris']:,}  {m['mesh_s']}s"
         )

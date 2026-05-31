@@ -9,8 +9,7 @@ current weight. Scenes assemble a list of DipoleSpec and call:
     cu             = dipole_arrows(params, sc)              # Cu-format coil arrows
 
 The module is self-contained: it depends only on cube_config / ng_config and
-NGSolve's Netgen mesher — NONE of the fea_* pipeline — so it can outlive those
-files. Surface triangles are classified GEOMETRICALLY (by testing each triangle
+NGSolve's Netgen mesher. Surface triangles are classified GEOMETRICALLY (by testing each triangle
 centroid against the analytic rod/coil shapes), which works for any number of
 bodies without relying on Netgen domain/material bookkeeping.
 
@@ -18,7 +17,7 @@ Conventions
 -----------
 - A spec's `axis` is a unit vector pointing toward the dipole's "positive" end;
   a positive `weight` drives B along +axis. For cube edges e{a}{b} the axis
-  points toward the FIRST-named corner a (B toward a), matching coil_init.
+  points toward the FIRST-named corner a (B toward a).
 - All lengths are in mm. `length_scale` multiplies geometry at build time only
   (1.0 = render mesh in mm; 1e-3 = solver mesh in metres for real Tesla).
 """
@@ -61,14 +60,12 @@ class DipoleSpec:
     has_coil: bool = True           # build the coil body in the mesh
 
 
-# ── Cube frame (self-contained; mirrors geometry_ids corner numbering) ─────────
+# ── Cube frame (corner numbering c1..c8) ─────────────────────────────────────
 
 def cube_corner_positions(half: float = NG_CUBE_HALF_MM) -> dict:
     """8 skeleton corners c1..c8 at +/- half on each axis.
 
-    Numbering matches geometry_ids (CORNER_BY_K_TOP) so edge labels e{a}{b}
-    line up with coil_init / the old voxel scenes:
-        c1(+,+,+) c2(+,-,+) c3(-,-,+) c4(-,+,+)
+    Numbering: c1(+,+,+) c2(+,-,+) c3(-,-,+) c4(-,+,+)
         c5(+,+,-) c6(+,-,-) c7(-,-,-) c8(-,+,-)
     """
     h = float(half)
@@ -185,6 +182,8 @@ def build_dipole_mesh(
     s = float(length_scale)
     params = specs_to_params(specs, s)
     bodies = []
+    steel_vol = 0.0   # geometry units³ at scale s (rods don't overlap → summed)
+    copper_vol = 0.0
 
     for dp, sp in zip(params, specs):
         ax = Dir(sp.axis[0], sp.axis[1], sp.axis[2])
@@ -200,6 +199,7 @@ def build_dipole_mesh(
         if maxh_device_mm is not None:
             rod.maxh = float(maxh_device_mm) * s
         bodies.append(rod)
+        steel_vol += rod.mass
 
         if sp.has_coil:
             coil_h = sp.coil_length_mm * s
@@ -216,6 +216,7 @@ def build_dipole_mesh(
             if maxh_device_mm is not None:
                 coil.maxh = float(maxh_device_mm) * s
             bodies.append(coil)
+            copper_vol += coil.mass
 
     h = float(air_half_extent_mm) * s
     box = Box(Pnt(-h, -h, -h), Pnt(h, h, h))
@@ -227,7 +228,9 @@ def build_dipole_mesh(
 
     geo = OCCGeometry(Glue(bodies + [air]))
     ngmesh = geo.GenerateMesh(maxh=float(maxh_mm) * s)
-    meta = {"half_extent": h, "length_scale": s}
+    s3 = s ** 3
+    meta = {"half_extent": h, "length_scale": s,
+            "steel_vol_mm3": steel_vol / s3, "copper_vol_mm3": copper_vol / s3}
     return ngmesh, params, meta
 
 
@@ -307,7 +310,7 @@ def assemble_scene_payload(
     """
     import time
     from cube_config import MM_TO_SCENE, FRAME_EDGE_MM, FRAME_INSET_MM
-    from scene_render import frame_config_dict
+    from ng_render import frame_config_dict
 
     sc = MM_TO_SCENE if sc is None else sc
     corners = cube_corner_positions(half)
@@ -317,8 +320,10 @@ def assemble_scene_payload(
     )
     arrow_vs = round(arrow_radius_mm * 0.15 * sc, 4)
 
-    # Arrows + frame need no mesh, so build them first → they survive a mesh fail.
-    cu = dipole_arrows(specs_to_params(specs, 1.0), sc)
+    # Arrows + frame + drive totals need no mesh → they survive a mesh fail.
+    base_params = specs_to_params(specs, 1.0)
+    cu = dipole_arrows(base_params, sc)
+    drive = coil_drive_summary(base_params)
 
     scene = {
         "type": "fea_mesh",
@@ -361,11 +366,50 @@ def assemble_scene_payload(
             "maxh_mm": maxh_mm,
             "maxh_device_mm": maxh_device_mm,
             "mesh_s": round(build_s, 2),
+            **drive,
+            **mass_summary(_meta_g.get("steel_vol_mm3", 0.0),
+                           _meta_g.get("copper_vol_mm3", 0.0)),
         }
     except Exception as exc:  # noqa: BLE001 — keep frame + arrows; report the failure
-        scene["meta"] = {"error": f"{type(exc).__name__}: {exc}"}
+        scene["meta"] = {"error": f"{type(exc).__name__}: {exc}", **drive}
 
     return scene, build_s
+
+
+def assemble_coil_update(
+    scene_id: str,
+    specs: list,
+    coil_weights: dict,
+    *,
+    arrow_radius_mm: float,
+    half: float = NG_CUBE_HALF_MM,
+    sc=None,
+) -> dict:
+    """Recompute ONLY the current-dependent payload — no meshing.
+
+    Switching excitation (config) toggles/flips J in the copper but leaves the
+    steel+copper geometry identical, so the mesh never changes. This rebuilds
+    just the coil arrows, the frame polarity colours and the drive totals; the
+    viewer patches them onto the existing mesh.
+    """
+    from cube_config import MM_TO_SCENE, FRAME_EDGE_MM, FRAME_INSET_MM
+    from ng_render import frame_config_dict
+
+    sc = MM_TO_SCENE if sc is None else sc
+    corners = cube_corner_positions(half)
+    frame_config = frame_config_dict(
+        edge_mm=FRAME_EDGE_MM, height_mm=FRAME_EDGE_MM, inset_mm=FRAME_INSET_MM,
+        corner_pos_mm=corners, coil_weights=coil_weights, sc=sc,
+    )
+    base_params = specs_to_params(specs, 1.0)
+    return {
+        "type": "coil_update",
+        "scene_id": scene_id,
+        "frame_config": frame_config,
+        "voxel_size": round(arrow_radius_mm * 0.15 * sc, 4),
+        "cu": dipole_arrows(base_params, sc),
+        "meta": {**coil_drive_summary(base_params)},
+    }
 
 
 # ── Coil current arrows (Cu-format) ───────────────────────────────────────────
@@ -418,4 +462,59 @@ def dipole_arrows(params, sc: float, *, n_axial: int = 5, n_phi: int = 8) -> dic
         "objects": [],
         "color_positive": list(COIL_COLOR),
         "color_negative": list(COIL_COLOR_NEGATIVE),
+    }
+
+
+def coil_drive_summary(params) -> dict:
+    """Total coil drive at 1× strength for a list of coil param dicts (mm units).
+
+    Each energised coil is an annular sleeve carrying a uniform azimuthal source
+    current density |J| = |weight| * NG_COIL_CURRENT_A_MM2 (A/mm²). The summary
+    holds at strength 1×; the caller scales current ∝ strength, power ∝ strength².
+
+      - total_current_A : Σ ampere-turns = Σ |J| * (axial_len * radial_thickness)
+      - total_power_W   : Σ ohmic loss   = ρ_cu * Σ |J_SI|² * V_coil
+                          (treats the annulus as solid copper, fill factor 1)
+    """
+    from ng_config import NG_COIL_CURRENT_A_MM2, NG_COIL_RESISTIVITY_OHM_M
+
+    j_per_w = float(NG_COIL_CURRENT_A_MM2)          # A/mm² per unit weight
+    rho = float(NG_COIL_RESISTIVITY_OHM_M)
+    total_current = 0.0   # ampere-turns (A)
+    total_power = 0.0     # W
+    n_active = 0
+    for dp in params:
+        w = abs(float(dp.get("weight", 0.0)))
+        if w < 1e-12 or not dp.get("has_coil", True):
+            continue
+        n_active += 1
+        length_mm = 2.0 * float(dp["coil_half"])
+        r_in = float(dp["coil_inner"])
+        r_out = float(dp["coil_outer"])
+        thick_mm = r_out - r_in
+
+        j_mm2 = w * j_per_w                          # A/mm²
+        total_current += j_mm2 * (length_mm * thick_mm)
+
+        j_si = j_mm2 * 1.0e6                         # A/m²
+        vol_m3 = math.pi * (r_out * r_out - r_in * r_in) * length_mm * 1.0e-9
+        total_power += rho * j_si * j_si * vol_m3
+
+    return {
+        "total_current_A": total_current,
+        "total_power_W": total_power,
+        "n_active_coils": n_active,
+    }
+
+
+def mass_summary(steel_vol_mm3: float, copper_vol_mm3: float) -> dict:
+    """Steel + copper mass (grams) from OCC solid volumes (mm³)."""
+    from ng_config import NG_STEEL_DENSITY_G_CM3, NG_COPPER_DENSITY_G_CM3
+
+    steel_g = float(steel_vol_mm3) / 1000.0 * float(NG_STEEL_DENSITY_G_CM3)
+    copper_g = float(copper_vol_mm3) / 1000.0 * float(NG_COPPER_DENSITY_G_CM3)
+    return {
+        "steel_mass_g": steel_g,
+        "copper_mass_g": copper_g,
+        "total_mass_g": steel_g + copper_g,
     }
